@@ -4,7 +4,7 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
-**Version**: 0.2.0 (2026-08-12) — 視覚化・比較・検索の 3 ツールを追加。詳細は下記「v0.2 で足したもの」節。
+**Version**: 0.2.1 (2026-08-13) — v0.2.0 のレビュー指摘に沿った 3 改善: compare_sessions に z_threshold パラメータ明示 (判定責任の外部化) / 無効 session_id を structured error dict で返す / measure の途中失敗を partial 結果として保存。詳細は下記「v0.2 で足したもの」節。
 
 **License**: v0.x は MIT。 v1.0+ は AGPL-3.0 + commercial dual への切替 可能性 予告 (LICENSE file 参照)。 v0.x 分は 永久 MIT (irrevocable)。
 
@@ -38,8 +38,10 @@
 | `analyze_session` | 平均・σ・最小/最大・ドリフト・3σ外れ値を算出 |
 | `export_session_csv` | CSV に書き出し |
 | `plot_session` *(v0.2)* | ASCII スパークライン (▁▂▃▄▅▆▇█) でチャンネル別に視覚化 |
-| `compare_sessions` *(v0.2)* | 2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す |
+| `compare_sessions` *(v0.2)* | 2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す (v0.2.1: `z_threshold` 明示パラメータ) |
 | `search_sessions` *(v0.2)* | 日付範囲・note キーワード・port・channel でセッションを絞り込む |
+
+存在しない `session_id` を渡した場合、`plot_session` / `analyze_session` / `compare_sessions` / `export_session_csv` は例外を投げずに `{"error": "session_not_found", "session_id": "...", "hint": "..."}` を返す (v0.2.1)。AI から見て tool 呼び出しが例外で落ちるより、error 情報を含む dict が返る方がリトライ or 別 tool に自然に繋がる。
 
 対応する測定値の形式は3種類を自動判別します。
 
@@ -54,8 +56,13 @@ T=25.3,H=48.1     →  {"T": 25.3, "H": 48.1}
 **「毎回手でやる面倒」 を 1 つずつ引き受ける** ための 3 ツール。有料化予告済みの機能 (連続ロギング / 閾値アラート / 校正記録) とは非競合の、あくまで基本操作の拡張です。
 
 - **`plot_session`** — Excel を開かずに傾向・外れ値の位置がざっくり見える。matplotlib を入れない (依存を増やさない) ため、Unicode ブロック文字 8 段階で描画。サンプル数が多いときは平均でビン化して幅を合わせる。
-- **`compare_sessions`** — 「先週と比べて怪しくないか」 を AI が数値で判断できるように、2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す。`|z| > 3` で `significant_shift=true`。厳密な検定ではなく粗い目安。
+- **`compare_sessions`** — 「先週と比べて怪しくないか」 を AI が数値で判断できるように、2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す。**判定は呼び出し側の責任**: `z_threshold` パラメータ (既定 3.0) を明示指定でき、`significant_shift` は `|z| > z_threshold` を評価しただけ、`z_threshold_used` に採用値が反映されるので後から audit 可能。これは Welch's t-test の p 値でも t 分布 CDF による厳密検定でもない、粗い gate。厳密検定が必要なら生の `mean_shift_z` と `n` を取り出して外部で処理する。
 - **`search_sessions`** — `list_sessions` は直近 30 件しか返さないので、`~/.benchtop-mcp/` にセッションが溜まってきたらこちら。since/until (ISO 日時) + note キーワード (大文字小文字無視) + port + channel の AND 絞り込み。
+
+**v0.2.1 の追加改善** (v0.2.0 レビュー指摘対応):
+
+- **`measure` 途中失敗の partial 保存** — 装置切断・Ctrl+C・SerialException 等が起きても、そこまでに取れた行はセッションに保存され、返り値の `partial: true` と `abort_reason` で通知される。100 回中 60 で止まっても「60 行取れた + 止まった理由」が残る。全部捨てるより実運用の失敗解析に使える。
+- **無効 `session_id` の structured error** — 上の tool 表下の注記の通り、例外ではなく dict で返す。
 
 呼び出し例:
 
@@ -97,16 +104,19 @@ python benchtop_mcp.py --selftest
 [2] IDN応答: MOCK,BENCHTOP-SIM,0001,1.0.0
 [3] パース: 4形式すべてOK
 [4] 計測: 60行 / channels=['T', 'H', 'V']
-[5] 解析: T平均=25.011283 σ=0.047241 外れ値=0件
+[5] 解析: T平均=25.019967 σ=0.473851 外れ値=2件
 [6] CSV書き出し: ... (61行=ヘッダ1+データ60)
-[7] plot: width=40 T='▄▆▅▆▇▄▃▃▂▅▆▄▄▄▄▆▆▄▄▃▄▄▇▃▆▆▁▅▄▆▇▅▃▄▆▅▂▅▆▄' (len=40, range=0.209)
-[8] compare: shared=['T', 'H', 'V'] T delta_mean=0.056533 z=1.203 significant=False
-[9] search: note='selftest' で 4 件ヒット (s=True, s2=True)
+[7] plot: width=40 T='▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▂▄▄▄▄▄▆' (len=40, range=5.041)
+[8] compare: shared=['T', 'H', 'V'] T delta_mean=0.146467 z=1.573 significant=False
+[9] search: note='selftest' で 8 件ヒット (s=True, s2=True)
+[10] invalid id → structured error='session_not_found' / 有効 id → Session OK
+[11] compare threshold: |z|=1.573 strict(3.0)=False loose(0.5)=True
+[12] partial measurement: n_rows=5/20 aborted=True reason='RuntimeError: simulated device failure after 5 reads'
 
 全テスト成功。実機が無くてもこのサーバーは動作します。
 ```
 
-数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜9) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
+数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜12) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
 
 ### 3. Claude Desktop に登録する
 
@@ -124,6 +134,40 @@ python benchtop_mcp.py --selftest
 ```
 
 Claude Desktop を再起動すると、ツール一覧に `benchtop` が現れます。あとは普通に日本語で頼めます。
+
+### 3.5. 再起動後の動作確認 (推奨)
+
+いきなり本番の指示に入る前に、下の 3 step を挟むと「MCP server が本当に load されているか」「新 3 tool が Claude 側から見えているか」を確実に切り分けられます。MCP server load に失敗していても Claude は既存 tool で "それらしく" 答えてしまうので、失敗が結果に紛れないようにするための保険です。
+
+**Step 3.5-a: tool load 確認 (最優先)**
+
+```
+使える tool を全部挙げて
+```
+
+期待値: `benchtop` の 9 tool (`list_ports` / `send_command` / `measure` / `list_sessions` / `analyze_session` / `export_session_csv` / `plot_session` / `compare_sessions` / `search_sessions`) が挙がること。挙がらなければ config が読まれていない → `%APPDATA%\Claude\claude_desktop_config.json` の path を確認。
+
+**Step 3.5-b: seed データを 3 つ作る**
+
+`search_sessions` と `compare_sessions` の verify には、note で区別できる複数セッションが必要です。
+
+```
+mock で 30 回、note='seed-A' で測って。終わったら少し待って、同じく note='seed-B' で 30 回、
+また少し待って note='seed-C' で 30 回、計 3 セッション作って。
+```
+
+期待値: 3 つの `session_id` が返ること。各 `started_at` が数秒〜数十秒ずつずれていること (これが後の「一番古い/新しい」判定の根拠になる)。
+
+**Step 3.5-c: 新 3 tool を verify**
+
+```
+1. さっき作った seed-B の T チャンネルを plot で見せて  (→ plot_session)
+2. note に 'seed' を含むセッションを全部リストして      (→ search_sessions、started_at で新旧確認)
+3. seed-A と seed-C を z_threshold=2.0 で比べて、
+   T が有意にシフトしているか教えて                       (→ compare_sessions with explicit threshold)
+```
+
+期待値: (1) ▁▂▃▄▅▆▇█ のスパークライン + min/max/mean、(2) `seed-A` `seed-B` `seed-C` の 3 セッションが `started_at` 付きで一覧、(3) `mean_shift_z` の数値 + `z_threshold_used: 2.0` + `significant_shift` の bool。`compare_sessions` の判定閾値は明示指定した値で解釈されること (v0.2.1 の責任分界)。
 
 ---
 
@@ -217,9 +261,13 @@ benchtop-mcp は 「売れる条件 3 点」 全該当 = 有料化 candidate:
 ## 次にやるとよいこと
 
 1. `--selftest` を通す（最優先。ここが通れば土台は正しい）
-2. Claude Desktop に登録して、実際に日本語で呼んでみる
+2. Claude Desktop に登録して、実際に日本語で呼んでみる (再起動後は上の Step 3.5 の 3 step verify を先に)
 3. 手持ちの装置1台を繋いで、`send_command` で `*IDN?` に応答が返るか確認
-4. **自分が毎回手でやっている面倒な作業を1つ、ツールとして足す** — ここからが本当のオリジナルです
+4. **自分が毎回手でやっている面倒な作業を1つ、ツールとして足す** — ただし判定基準は AND 2 条件:
+   - (i) 1 回の測定で手作業が **3 step 以上** (装置接続 → コマンド送信 → CSV 貼付、のような複数手順)
+   - (ii) **週 1 回以上** 発生 (月 1 未満の作業は tool 化コスト > 手作業コスト)
+
+   どちらか外れる作業は tool 化しない。この 2 条件を通ったものだけ 4 tool 目候補として拾う。ここからが本当のオリジナルです。
 5. ライセンスを決めて GitHub に公開
 
 Elasticsearch は奥さんのレシピアプリから始まりました。最初から立派である必要はありません。

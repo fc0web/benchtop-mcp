@@ -185,6 +185,12 @@ class Session:
     channels: list[str] = field(default_factory=list)
     rows: list[dict[str, Any]] = field(default_factory=list)
     skipped: int = 0
+    # v0.2.1: 途中失敗 (KeyboardInterrupt / SerialException / 装置切断等) 時に
+    # 部分結果を保存するためのフィールド。正常完了時は None のまま。
+    # 旧 (v0.1/v0.2.0) JSON にはこのキーが無いが、default=None なので
+    # Session(**old_dict) は成功する (backward compatible)。
+    aborted_at: str | None = None
+    abort_reason: str | None = None
 
     def path(self) -> Path:
         return DATA_DIR / f"{self.id}.json"
@@ -201,6 +207,21 @@ def load_session(session_id: str) -> Session:
     if not p.exists():
         raise FileNotFoundError(f"セッションが見つかりません: {session_id}")
     return Session(**json.loads(p.read_text(encoding="utf-8")))
+
+
+def _load_session_or_error(session_id: str) -> Session | dict[str, Any]:
+    """MCP tool 層で使う load_session のラッパ。存在しない ID は例外ではなく
+    structured error dict を返す。AI から見て tool 呼び出しが例外で落ちるより、
+    「error 情報を含む dict が返る」方が自然にリトライ or 別 tool 呼び出しに繋がる。
+    """
+    try:
+        return load_session(session_id)
+    except FileNotFoundError:
+        return {
+            "error": "session_not_found",
+            "session_id": session_id,
+            "hint": "list_sessions または search_sessions で存在確認してください",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -265,19 +286,30 @@ class Bench:
         sid = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{random.randint(100, 999)}"
         session = Session(id=sid, port=port, started_at=_now(), note=note)
 
+        # v0.2.1: 途中失敗を捕捉して部分結果を保存する。
+        # 100 サンプルの途中 60 で失敗した場合、その 60 行と abort_reason を保存し、
+        # 上位 (MCP tool 層 / AI) に partial=True で通知する。全部捨てるより、
+        # 「どこで止まったか」 が残った方が実運用の失敗解析に使える。
         t_start = time.time()
-        for _ in range(samples):
-            raw = dev.send(command) if command else dev.read_line()
-            values = parse_line(raw)
-            if not values:
-                session.skipped += 1
-            else:
-                for k in values:
-                    if k not in session.channels:
-                        session.channels.append(k)
-                session.rows.append({"t": round(time.time() - t_start, 4), **values})
-            if interval_ms:
-                time.sleep(interval_ms / 1000.0)
+        try:
+            for _ in range(samples):
+                raw = dev.send(command) if command else dev.read_line()
+                values = parse_line(raw)
+                if not values:
+                    session.skipped += 1
+                else:
+                    for k in values:
+                        if k not in session.channels:
+                            session.channels.append(k)
+                    session.rows.append({"t": round(time.time() - t_start, 4), **values})
+                if interval_ms:
+                    time.sleep(interval_ms / 1000.0)
+        except KeyboardInterrupt:
+            session.aborted_at = _now()
+            session.abort_reason = "KeyboardInterrupt"
+        except Exception as e:
+            session.aborted_at = _now()
+            session.abort_reason = f"{type(e).__name__}: {e}"
 
         session.save()
         return session
@@ -410,17 +442,27 @@ class Bench:
         return result
 
     @staticmethod
-    def compare(sa: Session, sb: Session) -> dict[str, Any]:
+    def compare(sa: Session, sb: Session, z_threshold: float = 3.0) -> dict[str, Any]:
         """2 セッションをチャンネル単位で比較する。共通チャンネルについて
         mean・stdev・drift の差分と、Welch 型の z スコア (delta_mean / SE)
-        を返す。|z| > 3 のとき significant_shift=True。統計的有意性の代替で
-        はなく、AI が 「先週と比べて怪しくないか」 を判断するための粗い目安。
+        を返す。
+
+        判定は呼び出し側の責任である:
+          - `mean_shift_z` は生の z スコア (常に返る)
+          - `significant_shift` は |z| > z_threshold を評価しただけの真偽値
+          - `z_threshold_used` に採用値を反映するので後から audit 可能
+        これは Welch's t-test でも t 分布 CDF による p 値でもない。実運用の
+        「先週と比べて怪しくないか」 判定のための粗い gate である。厳密な検定
+        が必要な場合は生の z と n を取り出し、外部で処理すること。
         """
+        if z_threshold <= 0:
+            raise ValueError("z_threshold は正の実数を指定してください")
         stats_a = Bench.analyze(sa)["channels"]
         stats_b = Bench.analyze(sb)["channels"]
         result: dict[str, Any] = {
             "a": {"session_id": sa.id, "started_at": sa.started_at, "note": sa.note, "port": sa.port},
             "b": {"session_id": sb.id, "started_at": sb.started_at, "note": sb.note, "port": sb.port},
+            "z_threshold_used": z_threshold,
             "shared_channels": [],
             "only_in_a": [ch for ch in sa.channels if ch not in sb.channels],
             "only_in_b": [ch for ch in sb.channels if ch not in sa.channels],
@@ -446,7 +488,8 @@ class Bench:
                 "delta_drift": round(a["drift"] - b["drift"], 6),
                 "standard_error": round(se, 6),
                 "mean_shift_z": round(z, 3),
-                "significant_shift": abs(z) > 3.0,
+                "z_threshold_used": z_threshold,
+                "significant_shift": abs(z) > z_threshold,
             }
         return result
 
@@ -558,6 +601,11 @@ def measure(
     'T=25.3,H=48.1' のような key=value 形式、'25.3,48.1' のようなCSV形式、
     単一の数値のいずれも自動で解釈する。
 
+    途中失敗 (装置切断、Ctrl+C、SerialException 等) が起きた場合でも、
+    そこまでに取れた行はセッションに保存され、返り値の `partial` が True
+    になる。`abort_reason` に失敗内容が入る。100 回中 60 で止まっても
+    「60 行取れた」と「なぜ止まったか」が残るので、失敗解析に使える。
+
     Args:
         port: 装置のポート名。既定は 'mock'。
         samples: 読み取る回数（1〜10000）。
@@ -567,7 +615,8 @@ def measure(
         note: このセッションに付けるメモ。後から探すときの手がかりになる。
 
     Returns:
-        保存されたセッションIDと、その場での簡易サマリー。
+        保存されたセッションIDと、その場での簡易サマリー。partial が True
+        のとき部分結果 (abort_reason に理由)。
     """
     s = BENCH.measure(port, samples, interval_ms, baudrate, command, note)
     return {
@@ -576,6 +625,8 @@ def measure(
         "n_rows": len(s.rows),
         "skipped": s.skipped,
         "channels": s.channels,
+        "partial": s.aborted_at is not None,
+        "abort_reason": s.abort_reason,
         "summary": Bench.analyze(s)["channels"],
     }
 
@@ -593,19 +644,27 @@ def analyze_session(session_id: str) -> dict[str, Any]:
     件数・平均・標準偏差・最小/最大・ドリフト（最終値-初期値）を返し、
     平均から3σ以上離れた点を外れ値として列挙する。
     装置の異常や測定のばらつきを判断するために使う。
+    存在しない session_id は structured error dict を返す (例外は投げない)。
     """
-    return Bench.analyze(load_session(session_id))
+    s = _load_session_or_error(session_id)
+    if isinstance(s, dict):
+        return s
+    return Bench.analyze(s)
 
 
 @server.tool()
 def export_session_csv(session_id: str, out_path: str) -> dict[str, Any]:
     """保存済みセッションを CSV ファイルに書き出す。
 
+    存在しない session_id は structured error dict を返す (例外は投げない)。
+
     Args:
         session_id: 対象のセッションID。
         out_path: 書き出し先のファイルパス。例: '/tmp/run1.csv'
     """
-    s = load_session(session_id)
+    s = _load_session_or_error(session_id)
+    if isinstance(s, dict):
+        return s
     p = Bench.export_csv(s, out_path)
     return {"session_id": session_id, "path": str(p), "n_rows": len(s.rows), "columns": ["t"] + s.channels}
 
@@ -622,29 +681,53 @@ def plot_session(session_id: str, width: int = 60) -> dict[str, Any]:
     各チャンネル別に、値の時系列を Unicode ブロック文字 8 段階で表現し、
     min/max/mean/range も同時に返す。matplotlib 等の依存を増やさず、Excel を
     開かずに傾向・外れ値の位置をざっくり把握したいときに使う。
+    存在しない session_id は structured error dict を返す (例外は投げない)。
 
     Args:
         session_id: 対象のセッションID。
         width: スパークラインの横幅（サンプル数がこれより多ければ平均でビン化）。
                既定は 60。1 以上を指定すること。
     """
-    return Bench.plot(load_session(session_id), width)
+    s = _load_session_or_error(session_id)
+    if isinstance(s, dict):
+        return s
+    return Bench.plot(s, width)
 
 
 @server.tool()
-def compare_sessions(session_id_a: str, session_id_b: str) -> dict[str, Any]:
+def compare_sessions(
+    session_id_a: str,
+    session_id_b: str,
+    z_threshold: float = 3.0,
+) -> dict[str, Any]:
     """2 つのセッションをチャンネル単位で比較する。
 
     共通する各チャンネルについて mean・stdev・drift の差分を計算し、
-    Welch 型の z スコア (delta_mean / SE) も返す。|z| > 3 のとき
-    significant_shift=True。「先週と比べて質が落ちていないか」 の判断に使う。
-    厳密な統計的検定ではなく AI 判断のための粗い目安。
+    Welch 型の z スコア (delta_mean / SE) も返す。
+
+    判定は呼び出し側の責任 (どちらの id が新しい/基準か + どこで有意判定するか):
+      - `mean_shift_z` は生の z スコア (常に返る)
+      - `significant_shift` は |z| > z_threshold を評価しただけの真偽値
+      - `z_threshold_used` に採用値を反映するので後から audit 可能
+
+    これは Welch's t-test の p 値でも t 分布 CDF による厳密検定でもない。
+    「先週と比べて怪しくないか」 判定のための粗い gate である。
+    存在しない session_id は structured error dict を返す (例外は投げない)。
 
     Args:
         session_id_a: 比較元のセッションID (通常は新しい方)。
         session_id_b: 比較先のセッションID (通常は古い方・基準)。
+        z_threshold: |z| がこの値を超えたとき significant_shift=True になる正の実数。
+                     既定は 3.0 (「3σ を超える平均シフト」 相当)。厳密な検定を
+                     したいときは この値を明示指定し、生の z を外部で処理すること。
     """
-    return Bench.compare(load_session(session_id_a), load_session(session_id_b))
+    a = _load_session_or_error(session_id_a)
+    if isinstance(a, dict):
+        return a
+    b = _load_session_or_error(session_id_b)
+    if isinstance(b, dict):
+        return b
+    return Bench.compare(a, b, z_threshold)
 
 
 @server.tool()
@@ -756,6 +839,62 @@ def _selftest() -> int:
     assert s.id in {h["session_id"] for h in hits_port}
     hits_none = Bench.search_sessions(note_contains="__no_such_marker__", limit=10)
     assert hits_none == []
+
+    # v0.2.1 追加 phase --------------------------------------------------------
+
+    err = _load_session_or_error("no-such-session-id-xyz")
+    assert isinstance(err, dict) and err.get("error") == "session_not_found"
+    ok = _load_session_or_error(s.id)
+    assert isinstance(ok, Session)
+    print(f"[10] invalid id → structured error='{err['error']}' / 有効 id → Session OK")
+
+    cmp_strict = Bench.compare(load_session(s.id), load_session(s2.id), z_threshold=3.0)
+    cmp_loose = Bench.compare(load_session(s.id), load_session(s2.id), z_threshold=0.5)
+    z = cmp_strict["channels"]["T"]["mean_shift_z"]
+    strict_sig = cmp_strict["channels"]["T"]["significant_shift"]
+    loose_sig = cmp_loose["channels"]["T"]["significant_shift"]
+    print(f"[11] compare threshold: |z|={abs(z)} strict(3.0)={strict_sig} loose(0.5)={loose_sig}")
+    assert cmp_strict["z_threshold_used"] == 3.0
+    assert cmp_loose["z_threshold_used"] == 0.5
+    assert cmp_strict["channels"]["T"]["z_threshold_used"] == 3.0
+    assert strict_sig == (abs(z) > 3.0)
+    assert loose_sig == (abs(z) > 0.5)
+    try:
+        Bench.compare(load_session(s.id), load_session(s2.id), z_threshold=0)
+        raise AssertionError("z_threshold=0 が ValueError にならなかった")
+    except ValueError:
+        pass
+
+    class _FailingDevice(Device):
+        """selftest 用: N 回読んだ後 RuntimeError を投げる仮想装置。"""
+
+        def __init__(self, fail_after: int) -> None:
+            self._n = 0
+            self._fail_after = fail_after
+            self._real = MockDevice(seed=42)
+
+        def send(self, command: str) -> str:
+            return self._real.send(command)
+
+        def read_line(self) -> str:
+            self._n += 1
+            if self._n > self._fail_after:
+                raise RuntimeError(f"simulated device failure after {self._fail_after} reads")
+            return self._real.read_line()
+
+    fail_after = 5
+    BENCH._devices["fail-selftest@9600"] = _FailingDevice(fail_after=fail_after)
+    s3 = BENCH.measure(port="fail-selftest", samples=20, interval_ms=0, note="selftest-partial")
+    print(
+        f"[12] partial measurement: n_rows={len(s3.rows)}/20 "
+        f"aborted={s3.aborted_at is not None} reason='{s3.abort_reason}'"
+    )
+    assert s3.aborted_at is not None
+    assert s3.abort_reason and "RuntimeError" in s3.abort_reason
+    # 5 回成功 → 6 回目で失敗、rows は 5 前後 (interval_ms=0 なので誤差極小)。
+    assert 1 <= len(s3.rows) <= fail_after + 1
+    partial_hit = Bench.search_sessions(note_contains="selftest-partial", limit=10)
+    assert any(h["session_id"] == s3.id for h in partial_hit)
 
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     return 0
