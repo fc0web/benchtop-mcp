@@ -6,6 +6,8 @@
 
 **Version**: 0.2.3 (2026-08-13) — v0.2.2 のレビュー第 3 波に対応: compare_sessions の docstring から 「Welch's t-test ではない」 の自己矛盾を撤回 (statistic は Welch t と同一、 異なるのは判定則) / `welch_df` (Welch-Satterthwaite 自由度) を per-channel に露出、caller が固定閾値の calibration を判断可能に / `n<2` (insufficient_samples) と `σ 合成=0` (zero_variance) の 2 guard を導入 (旧実装は 0/0→NaN→significant_shift=False の 「差が無い」 と静かに誤報していた path)。詳細は下記「v0.2 で足したもの」節。
 
+**Compatibility note**: v0.2.3 は `interpretation` field の値を `"threshold_gate_on_welch_standard_error"` (v0.2.2) → `"welch_t_statistic_with_fixed_z_threshold"` に rename しました。この文字列を pattern match していた caller は壊れます。現時点で外部 caller はいない想定なので実害ゼロですが、今後 return dict の field 値を触るときは breaking change 扱いとします (メジャー版 or 明示注記の伴う変更のみ)。
+
 **License**: v0.x は MIT。 v1.0+ は AGPL-3.0 + commercial dual への切替 可能性 予告 (LICENSE file 参照)。 v0.x 分は 永久 MIT (irrevocable)。
 
 ---
