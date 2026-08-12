@@ -460,34 +460,48 @@ class Bench:
     @staticmethod
     def compare(sa: Session, sb: Session, z_threshold: float = 3.0) -> dict[str, Any]:
         """2 セッションをチャンネル単位で比較する。共通チャンネルについて
-        mean・stdev・drift の差分と、Welch 型の z スコアを返す。
+        mean・stdev・drift の差分と、Welch 型の t 統計量 (z として扱う) を返す。
 
         使う式は 1 本だけ:
 
             z = (mean_A - mean_B) / sqrt(σ_A²/n_A + σ_B²/n_B)
 
-        つまり分母は per-sample の SD ではなく **平均の標準誤差 (SE) の
-        Welch 合成** である。n が大きいほど分母が小さくなり、同じ
-        z_threshold=3.0 が n=10 では緩く、n=100 では厳しくなる。
-        n=100 だと 「平均が 0.3σ 分ずれれば z=3」に相当する。この
-        非対称性は仕様であり bug ではない (「平均そのもののズレ」 を
-        見たいので n で割り込む)。
+        これは **Welch's t 検定の統計量そのもの**である。異なるのは判定則で
+        あって統計量ではない:
+          - Welch's t-test: t 分布の critical value (自由度依存) で判定 → p 値
+          - この tool: 固定閾値 `z_threshold` (既定 3.0) で単純 gate
 
-        判定は呼び出し側の責任である:
-          - `mean_shift_z` は生の z スコア (常に返る)
-          - `significant_shift` は |z| > z_threshold を評価しただけの真偽値
-          - `z_threshold_used` に採用値を反映するので後から audit 可能
-          - top-level に `is_hypothesis_test: false` + `disclaimer` を
-            立て、AI 側 (LLM) が 「有意です」 と言い換える前に反証できる
-            field として置く
-          - per-channel に `interpretation: "threshold_gate_on_welch_standard_error"`
+        `welch_df` (Welch-Satterthwaite 自由度) を per-channel に返すので、
+        caller は 「今回の n で固定閾値 3.0 が甘いか厳しいか」 を自分で判定
+        できる (n=5 で df≈8 なら本来 2.8〜4.6 が必要、n=100 で df≈198 なら
+        z=3 は α≈0.003 相当、など)。
 
-        これは Welch's t-test でも t 分布 CDF による p 値でもない。実運用の
-        「先週と比べて怪しくないか」 判定のための粗い gate である。厳密な検定
-        が必要な場合は生の z と n を取り出し、外部で処理すること。
+        分母は per-sample SD ではなく **平均の標準誤差 (SE) の Welch 合成**
+        なので、n が大きいほど固定閾値は厳しくなる (n=100 だと 「平均が 0.3σ
+        分ずれれば z=3」 に相当)。この非対称性は仕様。
+
+        判定は呼び出し側の責任:
+          - `mean_shift_z` は生の統計量 (guard 時は None)
+          - `welch_df` は自由度 (guard 時は None)
+          - `significant_shift` は |z| > z_threshold の真偽値 (guard 時は None)
+          - `gate_evaluable` / `gate_skip_reason` で 「gate が評価できたか」 を明示
+          - `z_threshold_used` / `z_formula` に採用値と式を反映
+          - top-level `is_hypothesis_test: false` + `disclaimer` で
+            「これは検定 (p 値/棄却域) ではない」を機械可読 field として提示
+          - per-channel `interpretation: "welch_t_statistic_with_fixed_z_threshold"`
+
+        **Guard (v0.2.3)**: 以下の case では gate を評価せず理由を返す:
+          - `n_A < 2` or `n_B < 2` → `gate_skip_reason: "insufficient_samples"`
+            (stdev が定義されない、または partial で abort が n=1 で起きた場合)
+          - `σ_A²/n_A + σ_B²/n_B == 0` → `gate_skip_reason: "zero_variance"`
+            (定数装置 / 極端な同値列。旧実装では 0/0 → NaN → False で
+            「差が無い」 と静かに誤報していた path)
+        いずれの場合も `mean_shift_z / welch_df / standard_error /
+        significant_shift` はすべて `None`。 caller は `None` を 「差が無い」
+        と読まないこと。「gate 未評価」 を意味する。
 
         v0.2.2: 入力セッションのどちらかが aborted (partial) の場合、
-        n の非対称が z を歪めるので、top-level の `any_input_aborted` +
+        n の非対称が z を歪めるので top-level の `any_input_aborted` +
         `aborted_inputs` で明示的に flag する (下流の判断責任に流す)。
         """
         if z_threshold <= 0:
@@ -520,10 +534,12 @@ class Bench:
             "z_formula": "z = (mean_A - mean_B) / sqrt(sigma_A^2 / n_A + sigma_B^2 / n_B)",
             "is_hypothesis_test": False,
             "disclaimer": (
-                "significant_shift is a boolean gate on |z| > z_threshold. "
-                "It is not a p-value, not a Welch's t-test, not a statistical "
-                "hypothesis test. The caller picks the threshold and owns the "
-                "interpretation."
+                "The 'mean_shift_z' statistic is identical to Welch's t "
+                "statistic. What differs from a Welch's t-test is the "
+                "decision rule: this gate uses a fixed |z| > z_threshold "
+                "instead of the t-distribution's df-dependent critical "
+                "value. Check 'welch_df' per channel to judge whether the "
+                "fixed threshold is calibrated for the actual sample sizes."
             ),
             "any_input_aborted": len(aborted_inputs) > 0,
             "aborted_inputs": aborted_inputs,
@@ -541,20 +557,57 @@ class Bench:
             if a is None or b is None:
                 continue
             delta_mean = a["mean"] - b["mean"]
-            na, nb = max(a["n"], 1), max(b["n"], 1)
-            se = math.sqrt((a["stdev"] ** 2) / na + (b["stdev"] ** 2) / nb)
-            z = (delta_mean / se) if se > 0 else 0.0
+            na, nb = a["n"], b["n"]
+
+            # v0.2.3 guard: n<2 (stdev 未定義) と σ 合成 0 (0/0 → NaN → 誤 False) を
+            # 明示的に別 path に分離。significant_shift を None にすることで
+            # 「差が無い」 との誤読を防ぐ (False は 「差が無い」 と読まれ得る)。
+            z: float | None
+            se: float | None
+            welch_df: float | None
+            gate_skip_reason: str | None
+            significant: bool | None
+
+            if na < 2 or nb < 2:
+                z = None
+                se = None
+                welch_df = None
+                gate_skip_reason = "insufficient_samples"
+                significant = None
+            else:
+                se_sq_a = (a["stdev"] ** 2) / na
+                se_sq_b = (b["stdev"] ** 2) / nb
+                se_sq_total = se_sq_a + se_sq_b
+                if se_sq_total <= 0:
+                    z = None
+                    se = None
+                    welch_df = None
+                    gate_skip_reason = "zero_variance"
+                    significant = None
+                else:
+                    se = math.sqrt(se_sq_total)
+                    z = delta_mean / se
+                    # Welch-Satterthwaite:
+                    # df = (se_sq_a + se_sq_b)^2 / (se_sq_a^2/(n_A-1) + se_sq_b^2/(n_B-1))
+                    df_den = (se_sq_a ** 2) / (na - 1) + (se_sq_b ** 2) / (nb - 1)
+                    welch_df = (se_sq_total ** 2) / df_den if df_den > 0 else None
+                    gate_skip_reason = None
+                    significant = abs(z) > z_threshold
+
             result["channels"][ch] = {
                 "a": {"mean": a["mean"], "stdev": a["stdev"], "drift": a["drift"], "n": a["n"]},
                 "b": {"mean": b["mean"], "stdev": b["stdev"], "drift": b["drift"], "n": b["n"]},
                 "delta_mean": round(delta_mean, 6),
                 "delta_stdev": round(a["stdev"] - b["stdev"], 6),
                 "delta_drift": round(a["drift"] - b["drift"], 6),
-                "standard_error": round(se, 6),
-                "mean_shift_z": round(z, 3),
+                "standard_error": round(se, 6) if se is not None else None,
+                "mean_shift_z": round(z, 3) if z is not None else None,
+                "welch_df": round(welch_df, 3) if welch_df is not None else None,
                 "z_threshold_used": z_threshold,
-                "significant_shift": abs(z) > z_threshold,
-                "interpretation": "threshold_gate_on_welch_standard_error",
+                "gate_evaluable": gate_skip_reason is None,
+                "gate_skip_reason": gate_skip_reason,
+                "significant_shift": significant,
+                "interpretation": "welch_t_statistic_with_fixed_z_threshold",
             }
         return result
 
@@ -770,25 +823,31 @@ def compare_sessions(
 ) -> dict[str, Any]:
     """2 つのセッションをチャンネル単位で比較する。
 
-    共通する各チャンネルについて mean・stdev・drift の差分を計算し、
-    Welch 型の z スコアを返す。使う式は 1 本だけ:
+    共通する各チャンネルについて mean・stdev・drift の差分と、Welch 型の
+    t 統計量 (z として返す) を計算する。式は 1 本:
 
         z = (mean_A - mean_B) / sqrt(sigma_A^2 / n_A + sigma_B^2 / n_B)
 
-    分母は per-sample の SD ではなく平均の標準誤差 (SE) の Welch 合成。
-    そのため n が大きいほど分母が小さくなり、同じ z_threshold=3.0 が
-    n=10 では緩く、n=100 では厳しくなる (n=100 で 「平均が 0.3σ 分ずれ
-    れば z=3」)。この非対称性は仕様。
+    これは Welch's t 検定の統計量そのもの。異なるのは判定則:
+      - Welch's t-test: t 分布 critical value (df 依存) で判定 → p 値
+      - この tool: 固定閾値 z_threshold (既定 3.0) で単純 gate
 
-    判定は呼び出し側の責任 (どちらの id が新しい/基準か + どこで gate するか):
-      - `mean_shift_z` は生の z スコア (常に返る)
-      - `significant_shift` は |z| > z_threshold の真偽値
-      - `z_threshold_used` / `z_formula` に採用値と式を明示
+    per-channel に `welch_df` (Welch-Satterthwaite 自由度) を返すので、
+    caller は 「今回の n で固定 3.0 が甘い/厳しい」 を自分で判定できる。
+
+    判定は呼び出し側の責任:
+      - `mean_shift_z` は生の t 統計量 (guard 時は None)
+      - `welch_df` は自由度 (guard 時は None)
+      - `significant_shift` は |z| > z_threshold (guard 時は None)
+      - `gate_evaluable` + `gate_skip_reason` で 「gate 未評価」 を明示
       - top-level `is_hypothesis_test: false` + `disclaimer` で
-        「これは統計的検定ではない」を機械可読 field として提示
+        「これは検定ではない」を機械可読 field として提示
 
-    これは Welch's t-test の p 値でも t 分布 CDF による厳密検定でもない。
-    「先週と比べて怪しくないか」 判定のための粗い gate である。
+    v0.2.3 guard: n<2 (stdev 未定義) と σ 合成=0 (定数装置) では
+    gate 評価不能。z / welch_df / significant_shift はすべて None、
+    `gate_skip_reason` に理由 (`"insufficient_samples"` or `"zero_variance"`)。
+    None は 「差が無い」 ではなく 「gate 未評価」 と読むこと。
+
     存在しない session_id は structured error dict を返す (例外は投げない)。
     入力のどちらかが aborted (partial) な場合は top-level の
     `any_input_aborted: true` + `aborted_inputs: ["a"/"b"]` で通知される。
@@ -797,8 +856,8 @@ def compare_sessions(
         session_id_a: 比較元のセッションID (通常は新しい方)。
         session_id_b: 比較先のセッションID (通常は古い方・基準)。
         z_threshold: |z| がこの値を超えたとき significant_shift=True になる正の実数。
-                     既定は 3.0 (「3σ を超える平均シフト」 相当)。厳密な検定を
-                     したいときは この値を明示指定し、生の z を外部で処理すること。
+                     既定は 3.0 (df に依らない固定値)。厳密な検定をしたいときは
+                     この値と `welch_df` を見て外部で t 分布 CDF に流すこと。
     """
     a = _load_session_or_error(session_id_a)
     if isinstance(a, dict):
@@ -930,14 +989,20 @@ def _selftest() -> int:
     cmp_strict = Bench.compare(load_session(s.id), load_session(s2.id), z_threshold=3.0)
     cmp_loose = Bench.compare(load_session(s.id), load_session(s2.id), z_threshold=0.5)
     z = cmp_strict["channels"]["T"]["mean_shift_z"]
+    df_strict = cmp_strict["channels"]["T"]["welch_df"]
     strict_sig = cmp_strict["channels"]["T"]["significant_shift"]
     loose_sig = cmp_loose["channels"]["T"]["significant_shift"]
-    print(f"[11] compare threshold: |z|={abs(z)} strict(3.0)={strict_sig} loose(0.5)={loose_sig}")
+    print(
+        f"[11] compare threshold: |z|={abs(z)} welch_df={df_strict} "
+        f"strict(3.0)={strict_sig} loose(0.5)={loose_sig}"
+    )
     assert cmp_strict["z_threshold_used"] == 3.0
     assert cmp_loose["z_threshold_used"] == 0.5
     assert cmp_strict["channels"]["T"]["z_threshold_used"] == 3.0
     assert strict_sig == (abs(z) > 3.0)
     assert loose_sig == (abs(z) > 0.5)
+    # v0.2.3: 正常 n では welch_df が非 None (df ~ 2n-2 に近づくはず, n=60 で df~118)
+    assert df_strict is not None and df_strict > 50
     try:
         Bench.compare(load_session(s.id), load_session(s2.id), z_threshold=0)
         raise AssertionError("z_threshold=0 が ValueError にならなかった")
@@ -1008,12 +1073,80 @@ def _selftest() -> int:
     assert cmp_asym["is_hypothesis_test"] is False
     assert "z_formula" in cmp_asym and "disclaimer" in cmp_asym
     for ch_entry in cmp_asym["channels"].values():
-        assert ch_entry["interpretation"] == "threshold_gate_on_welch_standard_error"
+        assert ch_entry["interpretation"] == "welch_t_statistic_with_fixed_z_threshold"
+        # v0.2.3: 正常 n では welch_df + gate_evaluable が付いていること
+        assert ch_entry["welch_df"] is not None and ch_entry["welch_df"] > 0
+        assert ch_entry["gate_evaluable"] is True
+        assert ch_entry["gate_skip_reason"] is None
     # clean な 2 セッション同士は any_input_aborted=false、aborted_inputs=[]
     assert cmp_clean["any_input_aborted"] is False and cmp_clean["aborted_inputs"] == []
     # search: partial=true/false が各行に立つ
     assert partial_rows and partial_rows[0]["partial"] is True
     assert normal_rows and normal_rows[0]["partial"] is False
+
+    # [14] compare guard: zero_variance と insufficient_samples の 2 case
+    # 旧実装 (v0.2.2 以前) では σ=0 で 0/0→NaN→significant_shift=False に落ちる
+    # 「静かな bug」 が存在。v0.2.3 で明示 guard に分離。
+
+    class _ConstDevice(Device):
+        """selftest 用: 常に同一値を返す仮想装置 (σ=0 を作る)。"""
+
+        def __init__(self, value: float = 3.3) -> None:
+            self._v = value
+
+        def send(self, command: str) -> str:
+            return self.read_line()
+
+        def read_line(self) -> str:
+            return f"V={self._v:.4f}"
+
+    # Case (a): 定数 mock 2 本 → σ=0 → zero_variance guard
+    BENCH._devices["const-a@9600"] = _ConstDevice(3.3)
+    BENCH._devices["const-b@9600"] = _ConstDevice(3.3)
+    sc_a = BENCH.measure(port="const-a", samples=15, interval_ms=0, note="selftest-const-a")
+    sc_b = BENCH.measure(port="const-b", samples=15, interval_ms=0, note="selftest-const-b")
+    cmp_zv = Bench.compare(load_session(sc_a.id), load_session(sc_b.id))
+    v_ch = cmp_zv["channels"]["V"]
+    print(
+        f"[14a] zero variance guard: evaluable={v_ch['gate_evaluable']} "
+        f"reason={v_ch['gate_skip_reason']} z={v_ch['mean_shift_z']} "
+        f"sig={v_ch['significant_shift']} df={v_ch['welch_df']}"
+    )
+    assert v_ch["gate_evaluable"] is False
+    assert v_ch["gate_skip_reason"] == "zero_variance"
+    assert v_ch["mean_shift_z"] is None
+    assert v_ch["significant_shift"] is None
+    assert v_ch["welch_df"] is None
+    assert v_ch["standard_error"] is None
+
+    # Case (b): n=1 の partial × 正常 → insufficient_samples guard
+    BENCH._devices["fail-immediate@9600"] = _FailingDevice(fail_after=1)
+    s_tiny = BENCH.measure(port="fail-immediate", samples=10, interval_ms=0, note="selftest-tiny")
+    assert len(s_tiny.rows) == 1, f"想定 n=1 だが {len(s_tiny.rows)} 行"
+    cmp_tiny = Bench.compare(load_session(s_tiny.id), load_session(s.id))
+    t_ch = cmp_tiny["channels"]["T"]
+    print(
+        f"[14b] insufficient n guard: evaluable={t_ch['gate_evaluable']} "
+        f"reason={t_ch['gate_skip_reason']} n_a={t_ch['a']['n']} n_b={t_ch['b']['n']}"
+    )
+    assert t_ch["gate_evaluable"] is False
+    assert t_ch["gate_skip_reason"] == "insufficient_samples"
+    assert t_ch["mean_shift_z"] is None
+    assert t_ch["significant_shift"] is None
+    assert t_ch["welch_df"] is None
+    # top-level は依然 partial 情報を露出 (guard と直交)
+    assert cmp_tiny["any_input_aborted"] is True
+    assert cmp_tiny["aborted_inputs"] == ["a"]
+
+    # Case (c): guard 発火する chunk と発火しない chunk が同 dict で共存できる
+    # (V チャンネルの zero_variance 判定は T チャンネルの正常判定に影響しない)
+    print(
+        f"[14c] guard 独立性: 正常 case (phase [11] 再利用) "
+        f"evaluable={cmp_strict['channels']['T']['gate_evaluable']} 対 "
+        f"guard case evaluable={cmp_zv['channels']['V']['gate_evaluable']}"
+    )
+    assert cmp_strict["channels"]["T"]["gate_evaluable"] is True
+    assert cmp_zv["channels"]["V"]["gate_evaluable"] is False
 
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     return 0

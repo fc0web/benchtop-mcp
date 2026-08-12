@@ -4,7 +4,7 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
-**Version**: 0.2.2 (2026-08-13) — v0.2.1 のレビュー第 2 波に対応: compare_sessions に z の式そのものを明記 + `is_hypothesis_test: false` / `disclaimer` / `z_formula` / `interpretation` の 4 field で 「これは検定ではない」 を機械可読に固定 / partial session の flag を analyze・plot・compare・search の全下流に mirror (`any_input_aborted` + `aborted_inputs` + 各行 `partial`) / plot_session に `label` + `channels_order` の legend contract を追加。詳細は下記「v0.2 で足したもの」節。
+**Version**: 0.2.3 (2026-08-13) — v0.2.2 のレビュー第 3 波に対応: compare_sessions の docstring から 「Welch's t-test ではない」 の自己矛盾を撤回 (statistic は Welch t と同一、 異なるのは判定則) / `welch_df` (Welch-Satterthwaite 自由度) を per-channel に露出、caller が固定閾値の calibration を判断可能に / `n<2` (insufficient_samples) と `σ 合成=0` (zero_variance) の 2 guard を導入 (旧実装は 0/0→NaN→significant_shift=False の 「差が無い」 と静かに誤報していた path)。詳細は下記「v0.2 で足したもの」節。
 
 **License**: v0.x は MIT。 v1.0+ は AGPL-3.0 + commercial dual への切替 可能性 予告 (LICENSE file 参照)。 v0.x 分は 永久 MIT (irrevocable)。
 
@@ -56,7 +56,13 @@ T=25.3,H=48.1     →  {"T": 25.3, "H": 48.1}
 **「毎回手でやる面倒」 を 1 つずつ引き受ける** ための 3 ツール。有料化予告済みの機能 (連続ロギング / 閾値アラート / 校正記録) とは非競合の、あくまで基本操作の拡張です。
 
 - **`plot_session`** — Excel を開かずに傾向・外れ値の位置がざっくり見える。matplotlib を入れない (依存を増やさない) ため、Unicode ブロック文字 8 段階で描画。サンプル数が多いときは平均でビン化して幅を合わせる。
-- **`compare_sessions`** — 「先週と比べて怪しくないか」 を AI が数値で判断できるように、2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す。**使う式は 1 本だけ**: `z = (mean_A − mean_B) / sqrt(σ_A²/n_A + σ_B²/n_B)`。分母は per-sample の SD ではなく **平均の標準誤差 (SE) の Welch 合成** なので、n が大きいほど同じ `z_threshold` が厳しくなる (n=100 なら 「平均が 0.3σ 分ずれれば z=3」)。**判定は呼び出し側の責任**: `z_threshold` パラメータ (既定 3.0) を明示指定でき、`significant_shift` は `|z| > z_threshold` を評価しただけ、`z_threshold_used` / `z_formula` に採用値と式が反映されるので後から audit 可能。これは Welch's t-test の p 値でも t 分布 CDF による厳密検定でもない、粗い gate。厳密検定が必要なら生の `mean_shift_z` と `n` を取り出して外部で処理する。 v0.2.2: `is_hypothesis_test: false` / `disclaimer` / per-channel `interpretation: "threshold_gate_on_welch_standard_error"` を機械可読 field として置き、LLM 側が 「有意です」 と言い換える前に反証できる契約にしている。
+- **`compare_sessions`** — 「先週と比べて怪しくないか」 を AI が数値で判断できるように、2 セッションの mean/stdev/drift 差分と Welch 型 t 統計量 (`mean_shift_z` として返す) を計算する。**使う式は 1 本だけ**: `z = (mean_A − mean_B) / sqrt(σ_A²/n_A + σ_B²/n_B)`。これは **Welch's t 検定の統計量そのもの** (v0.2.3 訂正: v0.2.2 では 「Welch's t-test ではない」 と書いていたが、 statistic は同一で異なるのは判定則という書き分けが正確)。異なるのは:
+  - Welch's t-test は t 分布 critical value (自由度依存) で判定 → p 値
+  - この tool は 固定閾値 `z_threshold` (既定 3.0) で単純 gate
+
+  `welch_df` (Welch-Satterthwaite 自由度) を per-channel に返すので、caller は 「今回の n で固定 3.0 が甘い/厳しい」 を自分で判定できる (v0.2.3 追加)。分母は per-sample の SD ではなく **平均の標準誤差 (SE) の Welch 合成** なので、n が大きいほど固定閾値は厳しくなる (n=100 なら 「平均が 0.3σ 分ずれれば z=3」)。**判定は呼び出し側の責任**: `z_threshold` パラメータ (既定 3.0) を明示指定でき、`z_threshold_used` / `z_formula` に採用値と式が反映されるので後から audit 可能。`is_hypothesis_test: false` / `disclaimer` / per-channel `interpretation: "welch_t_statistic_with_fixed_z_threshold"` を機械可読 field として置く。
+
+  **Guard (v0.2.3)**: `n<2` (stdev 未定義) または `σ_A²/n_A + σ_B²/n_B = 0` (定数装置) の場合、gate を評価せずに `gate_evaluable: false` + `gate_skip_reason: "insufficient_samples" or "zero_variance"` を返し、`mean_shift_z` / `welch_df` / `standard_error` / `significant_shift` はすべて `None`。旧実装 (v0.2.2 以前) では 0/0→NaN→`significant_shift=False` に落ちて 「差が無い」 と静かに誤報していた path を明示 guard で分離。`None` は 「差が無い」 ではなく 「gate 未評価」 と読むこと。
 - **`search_sessions`** — `list_sessions` は直近 30 件しか返さないので、`~/.benchtop-mcp/` にセッションが溜まってきたらこちら。since/until (ISO 日時) + note キーワード (大文字小文字無視) + port + channel の AND 絞り込み。
 
 **v0.2.1 の追加改善** (v0.2.0 レビュー指摘対応):
@@ -69,6 +75,12 @@ T=25.3,H=48.1     →  {"T": 25.3, "H": 48.1}
 - **`compare_sessions` の z 式明示 + 検定ではないことの機械可読契約** — 上の compare_sessions 説明参照。docstring は人間 (caller) には届くが LLM の出力語彙までは縛れないので、return dict の `is_hypothesis_test: false` + `disclaimer` + per-channel `interpretation` で field 名として置いている。
 - **partial の下流波及** — `Session.aborted_at` が立った session は、`analyze_session` / `plot_session` の top-level に `partial: true` + `abort_reason` を mirror。`compare_sessions` は 2 入力の非対称 n が z を歪めうるので `any_input_aborted: true` + `aborted_inputs: ["a" or "b"]` を top-level に立てる。`search_sessions` / `list_sessions` の各行にも `partial` を出す。中断された session が下流のどの tool を通っても事実が消えない契約。
 - **`plot_session` の legend contract** — per-channel dict に `label: str` (= channel 名) を追加、top-level に `channels_order: [str]` で render 順を明示。§3.5-c で 「どの line が どの channel か」 を目視 verify する際の後方支援。単位 (unit) は v0.3 へ defer 継続。
+
+**v0.2.3 の追加改善** (v0.2.2 レビュー指摘対応):
+
+- **compare docstring の自己矛盾撤回** — v0.2.2 は 「これは Welch's t-test ではない」 と書いていたが、上の式が示す通り statistic は Welch t そのもの。訂正: 「statistic は Welch t と同一、異なるのは判定則 (df 依存 critical value vs 固定閾値)」 と書き分け。per-channel `interpretation` string も `"threshold_gate_on_welch_standard_error"` → `"welch_t_statistic_with_fixed_z_threshold"` に更新。
+- **Welch-Satterthwaite `welch_df` 露出** — per-channel に `welch_df` field を追加。固定閾値 3.0 は n=5 で df≈8 なら本来 2.8〜4.6 が必要 (甘い側)、n=100 で df≈198 なら α≈0.003 相当 (厳しい側) と n 依存する。df を露出することで caller が 「今回の n でこの gate を信用していい範囲か」 を自分で判断できる。partial session は n が任意に小さくなり得るので、この露出は下流波及と繋がっている。
+- **zero_variance / insufficient_samples guard** — 実害寄りの gap: mock device が定数を返す構成 (σ=0) や n=1 の partial session を compare すると、旧実装は `se=0 → z=0/0` (NaN) → `abs(z) > 3.0` は常に `False` に落ちて 「差が無い」 と静かに報告していた。v0.2.3 で明示 guard を導入: `n<2` → `gate_skip_reason: "insufficient_samples"`、`σ_A²/n_A + σ_B²/n_B = 0` → `gate_skip_reason: "zero_variance"`。どちらの場合も `mean_shift_z` / `welch_df` / `significant_shift` はすべて `None` (`False` にすると 「差が無い」 と 誤読されるので `None` = 「未評価」 signal に分離)。selftest phase [14] で `_ConstDevice` と `_FailingDevice(fail_after=1)` の 2 case verify。
 
 呼び出し例:
 
@@ -116,14 +128,17 @@ python benchtop_mcp.py --selftest
 [8] compare: shared=['T', 'H', 'V'] T delta_mean=0.146467 z=1.573 significant=False
 [9] search: note='selftest' で 8 件ヒット (s=True, s2=True)
 [10] invalid id → structured error='session_not_found' / 有効 id → Session OK
-[11] compare threshold: |z|=1.797 strict(3.0)=False loose(0.5)=True
+[11] compare threshold: |z|=0.507 welch_df=89.075 strict(3.0)=False loose(0.5)=True
 [12] partial measurement: n_rows=5/20 aborted=True reason='RuntimeError: simulated device failure after 5 reads'
 [13] partial downstream: analyze.partial=True/False plot.partial=True/False cmp.any_aborted=True/False cmp.aborted_inputs=['b'] search.partial=True/False
+[14a] zero variance guard: evaluable=False reason=zero_variance z=None sig=None df=None
+[14b] insufficient n guard: evaluable=False reason=insufficient_samples n_a=1 n_b=60
+[14c] guard 独立性: 正常 case (phase [11] 再利用) evaluable=True 対 guard case evaluable=False
 
 全テスト成功。実機が無くてもこのサーバーは動作します。
 ```
 
-数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜13) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
+数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜14) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
 
 ### 3. Claude Desktop に登録する
 
