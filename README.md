@@ -4,6 +4,8 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
+**Version**: 0.2.0 (2026-08-12) — 視覚化・比較・検索の 3 ツールを追加。詳細は下記「v0.2 で足したもの」節。
+
 **License**: v0.x は MIT。 v1.0+ は AGPL-3.0 + commercial dual への切替 可能性 予告 (LICENSE file 参照)。 v0.x 分は 永久 MIT (irrevocable)。
 
 ---
@@ -35,6 +37,9 @@
 | `list_sessions` | 保存済みセッションの一覧 |
 | `analyze_session` | 平均・σ・最小/最大・ドリフト・3σ外れ値を算出 |
 | `export_session_csv` | CSV に書き出し |
+| `plot_session` *(v0.2)* | ASCII スパークライン (▁▂▃▄▅▆▇█) でチャンネル別に視覚化 |
+| `compare_sessions` *(v0.2)* | 2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す |
+| `search_sessions` *(v0.2)* | 日付範囲・note キーワード・port・channel でセッションを絞り込む |
 
 対応する測定値の形式は3種類を自動判別します。
 
@@ -42,6 +47,28 @@
 T=25.3,H=48.1     →  {"T": 25.3, "H": 48.1}
 25.3,48.1         →  {"ch1": 25.3, "ch2": 48.1}
 25.3              →  {"value": 25.3}
+```
+
+### v0.2 で足したもの
+
+**「毎回手でやる面倒」 を 1 つずつ引き受ける** ための 3 ツール。有料化予告済みの機能 (連続ロギング / 閾値アラート / 校正記録) とは非競合の、あくまで基本操作の拡張です。
+
+- **`plot_session`** — Excel を開かずに傾向・外れ値の位置がざっくり見える。matplotlib を入れない (依存を増やさない) ため、Unicode ブロック文字 8 段階で描画。サンプル数が多いときは平均でビン化して幅を合わせる。
+- **`compare_sessions`** — 「先週と比べて怪しくないか」 を AI が数値で判断できるように、2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す。`|z| > 3` で `significant_shift=true`。厳密な検定ではなく粗い目安。
+- **`search_sessions`** — `list_sessions` は直近 30 件しか返さないので、`~/.benchtop-mcp/` にセッションが溜まってきたらこちら。since/until (ISO 日時) + note キーワード (大文字小文字無視) + port + channel の AND 絞り込み。
+
+呼び出し例:
+
+```
+「今日 mock で 5 回、それぞれ 30 秒ずつ測って、最後に一日分をまとめて見せて」
+→ measure × 5 → search_sessions(since='2026-08-12') → 各 session plot_session
+```
+
+```
+「先週の校正データと今の値を比べて、有意に動いていないか教えて」
+→ search_sessions(note_contains='calib') で基準を特定
+→ measure で今の値
+→ compare_sessions(session_id_a=今, session_id_b=基準)
 ```
 
 ---
@@ -66,15 +93,20 @@ python benchtop_mcp.py --selftest
 
 ```
 == benchtop-mcp セルフテスト ==
-[1] ポート一覧: 33件 / pyserial=True
+[1] ポート一覧: 3件 / pyserial=True
 [2] IDN応答: MOCK,BENCHTOP-SIM,0001,1.0.0
 [3] パース: 4形式すべてOK
 [4] 計測: 60行 / channels=['T', 'H', 'V']
-[5] 解析: T平均=25.028583 σ=0.274831 外れ値=1件
+[5] 解析: T平均=25.011283 σ=0.047241 外れ値=0件
 [6] CSV書き出し: ... (61行=ヘッダ1+データ60)
+[7] plot: width=40 T='▄▆▅▆▇▄▃▃▂▅▆▄▄▄▄▆▆▄▄▃▄▄▇▃▆▆▁▅▄▆▇▅▃▄▆▅▂▅▆▄' (len=40, range=0.209)
+[8] compare: shared=['T', 'H', 'V'] T delta_mean=0.056533 z=1.203 significant=False
+[9] search: note='selftest' で 4 件ヒット (s=True, s2=True)
 
 全テスト成功。実機が無くてもこのサーバーは動作します。
 ```
+
+数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜9) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
 
 ### 3. Claude Desktop に登録する
 

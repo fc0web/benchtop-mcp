@@ -27,6 +27,7 @@ import os
 import random
 import re
 import statistics
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -49,6 +50,9 @@ except ImportError:  # pragma: no cover
 
 DATA_DIR = Path(os.environ.get("BENCHTOP_DATA_DIR", Path.home() / ".benchtop-mcp"))
 MOCK_PORT = "mock"
+
+# v0.2: plot_session 用スパークライン文字 (8 段階、空白は使わない)
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 
 def _now() -> str:
@@ -357,6 +361,142 @@ class Bench:
                 continue
         return out
 
+    # -- v0.2 追加: 視覚化 / 比較 / 検索 --------------------------------------
+
+    @staticmethod
+    def plot(session: Session, width: int = 60) -> dict[str, Any]:
+        """各チャンネルを Unicode ブロック文字 (▁▂▃▄▅▆▇█) の 8 段階で
+        描画する。サンプル数が width より多いときは平均でビン化する。
+        matplotlib 等の依存を増やさず、Excel を開かずに傾向・外れ値の位置を
+        ざっくり把握するための最小道具。
+        """
+        result: dict[str, Any] = {
+            "session_id": session.id,
+            "port": session.port,
+            "started_at": session.started_at,
+            "width": width,
+            "n_rows": len(session.rows),
+            "channels": {},
+        }
+        for ch in session.channels:
+            xs = [r[ch] for r in session.rows if ch in r]
+            if not xs:
+                continue
+            lo, hi = min(xs), max(xs)
+            span = hi - lo if hi > lo else 1.0
+            if len(xs) > width and width > 0:
+                bin_size = len(xs) / width
+                display = []
+                for i in range(width):
+                    a = int(i * bin_size)
+                    b = int((i + 1) * bin_size)
+                    chunk = xs[a:b] if b > a else [xs[a]]
+                    display.append(sum(chunk) / len(chunk))
+            else:
+                display = xs
+            spark = "".join(
+                _SPARK_CHARS[min(7, max(0, int((v - lo) / span * 7.99)))]
+                for v in display
+            )
+            mean = sum(xs) / len(xs)
+            result["channels"][ch] = {
+                "sparkline": spark,
+                "n": len(xs),
+                "min": round(lo, 6),
+                "max": round(hi, 6),
+                "mean": round(mean, 6),
+                "range": round(hi - lo, 6),
+            }
+        return result
+
+    @staticmethod
+    def compare(sa: Session, sb: Session) -> dict[str, Any]:
+        """2 セッションをチャンネル単位で比較する。共通チャンネルについて
+        mean・stdev・drift の差分と、Welch 型の z スコア (delta_mean / SE)
+        を返す。|z| > 3 のとき significant_shift=True。統計的有意性の代替で
+        はなく、AI が 「先週と比べて怪しくないか」 を判断するための粗い目安。
+        """
+        stats_a = Bench.analyze(sa)["channels"]
+        stats_b = Bench.analyze(sb)["channels"]
+        result: dict[str, Any] = {
+            "a": {"session_id": sa.id, "started_at": sa.started_at, "note": sa.note, "port": sa.port},
+            "b": {"session_id": sb.id, "started_at": sb.started_at, "note": sb.note, "port": sb.port},
+            "shared_channels": [],
+            "only_in_a": [ch for ch in sa.channels if ch not in sb.channels],
+            "only_in_b": [ch for ch in sb.channels if ch not in sa.channels],
+            "channels": {},
+        }
+        for ch in sa.channels:
+            if ch not in sb.channels:
+                continue
+            result["shared_channels"].append(ch)
+            a = stats_a.get(ch)
+            b = stats_b.get(ch)
+            if a is None or b is None:
+                continue
+            delta_mean = a["mean"] - b["mean"]
+            na, nb = max(a["n"], 1), max(b["n"], 1)
+            se = math.sqrt((a["stdev"] ** 2) / na + (b["stdev"] ** 2) / nb)
+            z = (delta_mean / se) if se > 0 else 0.0
+            result["channels"][ch] = {
+                "a": {"mean": a["mean"], "stdev": a["stdev"], "drift": a["drift"], "n": a["n"]},
+                "b": {"mean": b["mean"], "stdev": b["stdev"], "drift": b["drift"], "n": b["n"]},
+                "delta_mean": round(delta_mean, 6),
+                "delta_stdev": round(a["stdev"] - b["stdev"], 6),
+                "delta_drift": round(a["drift"] - b["drift"], 6),
+                "standard_error": round(se, 6),
+                "mean_shift_z": round(z, 3),
+                "significant_shift": abs(z) > 3.0,
+            }
+        return result
+
+    @staticmethod
+    def search_sessions(
+        since: str | None = None,
+        until: str | None = None,
+        note_contains: str | None = None,
+        port: str | None = None,
+        channel: str | None = None,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """条件付きでセッションを絞り込む。list_sessions が直近 N 件しか
+        返さないので、セッションが増えたらこちらを使う。全条件 AND、
+        started_at は ISO 文字列辞書順で比較 (UTC 保存前提)。
+        """
+        if not DATA_DIR.exists():
+            return []
+        needle = note_contains.lower() if note_contains else None
+        out: list[dict[str, Any]] = []
+        for p in sorted(DATA_DIR.glob("*.json"), reverse=True):
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            started = d.get("started_at", "")
+            if since and started < since:
+                continue
+            if until and started > until:
+                continue
+            if port and d.get("port") != port:
+                continue
+            if channel and channel not in d.get("channels", []):
+                continue
+            if needle and needle not in (d.get("note", "") or "").lower():
+                continue
+            out.append(
+                {
+                    "session_id": d["id"],
+                    "port": d["port"],
+                    "started_at": started,
+                    "n_rows": len(d.get("rows", [])),
+                    "channels": d.get("channels", []),
+                    "note": d.get("note", ""),
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
 
 BENCH = Bench()
 
@@ -371,11 +511,13 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.1.0",
+    version="0.2.0",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
-        "典型的な流れ: list_ports → measure → analyze_session → export_session_csv"
+        "典型的な流れ: list_ports → measure → analyze_session → export_session_csv。"
+        "v0.2 追加: plot_session (ASCII 波形) / compare_sessions (2 セッション diff) / "
+        "search_sessions (日付・note・port・channel での絞り込み)。"
     ),
 )
 
@@ -469,12 +611,92 @@ def export_session_csv(session_id: str, out_path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# MCP 層 v0.2 追加ツール
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def plot_session(session_id: str, width: int = 60) -> dict[str, Any]:
+    """保存済みセッションを ASCII スパークライン (▁▂▃▄▅▆▇█) で視覚化する。
+
+    各チャンネル別に、値の時系列を Unicode ブロック文字 8 段階で表現し、
+    min/max/mean/range も同時に返す。matplotlib 等の依存を増やさず、Excel を
+    開かずに傾向・外れ値の位置をざっくり把握したいときに使う。
+
+    Args:
+        session_id: 対象のセッションID。
+        width: スパークラインの横幅（サンプル数がこれより多ければ平均でビン化）。
+               既定は 60。1 以上を指定すること。
+    """
+    return Bench.plot(load_session(session_id), width)
+
+
+@server.tool()
+def compare_sessions(session_id_a: str, session_id_b: str) -> dict[str, Any]:
+    """2 つのセッションをチャンネル単位で比較する。
+
+    共通する各チャンネルについて mean・stdev・drift の差分を計算し、
+    Welch 型の z スコア (delta_mean / SE) も返す。|z| > 3 のとき
+    significant_shift=True。「先週と比べて質が落ちていないか」 の判断に使う。
+    厳密な統計的検定ではなく AI 判断のための粗い目安。
+
+    Args:
+        session_id_a: 比較元のセッションID (通常は新しい方)。
+        session_id_b: 比較先のセッションID (通常は古い方・基準)。
+    """
+    return Bench.compare(load_session(session_id_a), load_session(session_id_b))
+
+
+@server.tool()
+def search_sessions(
+    since: str | None = None,
+    until: str | None = None,
+    note_contains: str | None = None,
+    port: str | None = None,
+    channel: str | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """保存済みセッションを条件で絞り込む。
+
+    list_sessions は直近 N 件しか返さないので、セッションが増えたらこちらを
+    使う。全条件 AND、started_at は ISO 文字列辞書順で比較 (UTC 保存前提)。
+
+    Args:
+        since: この日時以降のみ (ISO 形式、例 '2026-08-01' or '2026-08-01T00:00:00+00:00')。
+        until: この日時以前のみ (ISO 形式)。
+        note_contains: note に含まれる文字列 (大文字小文字を区別しない)。
+        port: このポートで計測したものだけ (完全一致)。
+        channel: このチャンネルを含むものだけ (例: 'T', 'V', 'ch1')。
+        limit: 返す最大件数。既定は 30。
+    """
+    return {
+        "data_dir": str(DATA_DIR),
+        "filters": {
+            "since": since,
+            "until": until,
+            "note_contains": note_contains,
+            "port": port,
+            "channel": channel,
+            "limit": limit,
+        },
+        "sessions": Bench.search_sessions(since, until, note_contains, port, channel, limit),
+    }
+
+
+# ---------------------------------------------------------------------------
 # エントリポイント
 # ---------------------------------------------------------------------------
 
 
 def _selftest() -> int:
     """実機も Claude も無い状態で、コアロジックが動くか確認する。"""
+    # Windows の CP932 端末では Unicode ブロック文字 (▁▂…█) が出力できないので
+    # stdout を UTF-8 に切り替える (Python 3.7+ の reconfigure が使える環境のみ)。
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     print("== benchtop-mcp セルフテスト ==")
     ports = BENCH.list_ports()
     print(f"[1] ポート一覧: {len(ports)}件 / pyserial={HAS_SERIAL}")
@@ -502,13 +724,44 @@ def _selftest() -> int:
     print(f"[6] CSV書き出し: {out} ({n}行=ヘッダ1+データ60)")
     assert n == 61
 
+    # v0.2 追加 phase --------------------------------------------------------
+
+    plot = Bench.plot(load_session(s.id), width=40)
+    t_spark = plot["channels"]["T"]["sparkline"]
+    print(f"[7] plot: width=40 T='{t_spark}' (len={len(t_spark)}, range={plot['channels']['T']['range']})")
+    assert 0 < len(t_spark) <= 40
+    assert all(c in _SPARK_CHARS for c in t_spark)
+    assert plot["channels"]["T"]["range"] >= 0
+
+    s2 = BENCH.measure(port=MOCK_PORT, samples=60, interval_ms=0, note="selftest-b")
+    cmp = Bench.compare(load_session(s.id), load_session(s2.id))
+    t_cmp = cmp["channels"]["T"]
+    print(
+        f"[8] compare: shared={cmp['shared_channels']} "
+        f"T delta_mean={t_cmp['delta_mean']} z={t_cmp['mean_shift_z']} "
+        f"significant={t_cmp['significant_shift']}"
+    )
+    assert "T" in cmp["shared_channels"] and "H" in cmp["shared_channels"] and "V" in cmp["shared_channels"]
+    assert cmp["only_in_a"] == [] and cmp["only_in_b"] == []
+    assert "delta_mean" in t_cmp and "mean_shift_z" in t_cmp
+
+    hits = Bench.search_sessions(note_contains="selftest", limit=100)
+    ids = {h["session_id"] for h in hits}
+    print(f"[9] search: note='selftest' で {len(hits)} 件ヒット (s={s.id in ids}, s2={s2.id in ids})")
+    assert s.id in ids and s2.id in ids
+    hits_b = Bench.search_sessions(note_contains="selftest-b", limit=100)
+    assert any(h["session_id"] == s2.id for h in hits_b)
+    assert all("selftest-b" in (h["note"] or "").lower() for h in hits_b)
+    hits_port = Bench.search_sessions(port=MOCK_PORT, note_contains="selftest", limit=100)
+    assert s.id in {h["session_id"] for h in hits_port}
+    hits_none = Bench.search_sessions(note_contains="__no_such_marker__", limit=10)
+    assert hits_none == []
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     return 0
 
 
 if __name__ == "__main__":
-    import sys
-
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
     server.run(transport="stdio")
