@@ -326,6 +326,8 @@ class Bench:
             "n_rows": len(session.rows),
             "skipped": session.skipped,
             "duration_s": round(session.rows[-1]["t"], 3) if session.rows else 0.0,
+            "partial": session.aborted_at is not None,
+            "abort_reason": session.abort_reason,
             "channels": {},
         }
 
@@ -387,6 +389,10 @@ class Bench:
                         "n_rows": len(d.get("rows", [])),
                         "channels": d.get("channels", []),
                         "note": d.get("note", ""),
+                        # v0.2.2: partial 情報を search/list 結果に mirror。
+                        # 旧 JSON (aborted_at key 不在) は None → false。
+                        "partial": d.get("aborted_at") is not None,
+                        "abort_reason": d.get("abort_reason"),
                     }
                 )
             except Exception:
@@ -401,13 +407,21 @@ class Bench:
         描画する。サンプル数が width より多いときは平均でビン化する。
         matplotlib 等の依存を増やさず、Excel を開かずに傾向・外れ値の位置を
         ざっくり把握するための最小道具。
+
+        v0.2.2: legend が必要なので per-channel dict に `label`、top-level に
+        `channels_order` (render 順の contract) を明示。中断 session の場合は
+        `partial` + `abort_reason` も top-level に出す。
         """
+        rendered_order: list[str] = []
         result: dict[str, Any] = {
             "session_id": session.id,
             "port": session.port,
             "started_at": session.started_at,
             "width": width,
             "n_rows": len(session.rows),
+            "partial": session.aborted_at is not None,
+            "abort_reason": session.abort_reason,
+            "channels_order": rendered_order,
             "channels": {},
         }
         for ch in session.channels:
@@ -432,6 +446,7 @@ class Bench:
             )
             mean = sum(xs) / len(xs)
             result["channels"][ch] = {
+                "label": ch,
                 "sparkline": spark,
                 "n": len(xs),
                 "min": round(lo, 6),
@@ -439,30 +454,79 @@ class Bench:
                 "mean": round(mean, 6),
                 "range": round(hi - lo, 6),
             }
+            rendered_order.append(ch)
         return result
 
     @staticmethod
     def compare(sa: Session, sb: Session, z_threshold: float = 3.0) -> dict[str, Any]:
         """2 セッションをチャンネル単位で比較する。共通チャンネルについて
-        mean・stdev・drift の差分と、Welch 型の z スコア (delta_mean / SE)
-        を返す。
+        mean・stdev・drift の差分と、Welch 型の z スコアを返す。
+
+        使う式は 1 本だけ:
+
+            z = (mean_A - mean_B) / sqrt(σ_A²/n_A + σ_B²/n_B)
+
+        つまり分母は per-sample の SD ではなく **平均の標準誤差 (SE) の
+        Welch 合成** である。n が大きいほど分母が小さくなり、同じ
+        z_threshold=3.0 が n=10 では緩く、n=100 では厳しくなる。
+        n=100 だと 「平均が 0.3σ 分ずれれば z=3」に相当する。この
+        非対称性は仕様であり bug ではない (「平均そのもののズレ」 を
+        見たいので n で割り込む)。
 
         判定は呼び出し側の責任である:
           - `mean_shift_z` は生の z スコア (常に返る)
           - `significant_shift` は |z| > z_threshold を評価しただけの真偽値
           - `z_threshold_used` に採用値を反映するので後から audit 可能
+          - top-level に `is_hypothesis_test: false` + `disclaimer` を
+            立て、AI 側 (LLM) が 「有意です」 と言い換える前に反証できる
+            field として置く
+          - per-channel に `interpretation: "threshold_gate_on_welch_standard_error"`
+
         これは Welch's t-test でも t 分布 CDF による p 値でもない。実運用の
         「先週と比べて怪しくないか」 判定のための粗い gate である。厳密な検定
         が必要な場合は生の z と n を取り出し、外部で処理すること。
+
+        v0.2.2: 入力セッションのどちらかが aborted (partial) の場合、
+        n の非対称が z を歪めるので、top-level の `any_input_aborted` +
+        `aborted_inputs` で明示的に flag する (下流の判断責任に流す)。
         """
         if z_threshold <= 0:
             raise ValueError("z_threshold は正の実数を指定してください")
         stats_a = Bench.analyze(sa)["channels"]
         stats_b = Bench.analyze(sb)["channels"]
+        aborted_inputs: list[str] = []
+        if sa.aborted_at is not None:
+            aborted_inputs.append("a")
+        if sb.aborted_at is not None:
+            aborted_inputs.append("b")
         result: dict[str, Any] = {
-            "a": {"session_id": sa.id, "started_at": sa.started_at, "note": sa.note, "port": sa.port},
-            "b": {"session_id": sb.id, "started_at": sb.started_at, "note": sb.note, "port": sb.port},
+            "a": {
+                "session_id": sa.id,
+                "started_at": sa.started_at,
+                "note": sa.note,
+                "port": sa.port,
+                "partial": sa.aborted_at is not None,
+                "abort_reason": sa.abort_reason,
+            },
+            "b": {
+                "session_id": sb.id,
+                "started_at": sb.started_at,
+                "note": sb.note,
+                "port": sb.port,
+                "partial": sb.aborted_at is not None,
+                "abort_reason": sb.abort_reason,
+            },
             "z_threshold_used": z_threshold,
+            "z_formula": "z = (mean_A - mean_B) / sqrt(sigma_A^2 / n_A + sigma_B^2 / n_B)",
+            "is_hypothesis_test": False,
+            "disclaimer": (
+                "significant_shift is a boolean gate on |z| > z_threshold. "
+                "It is not a p-value, not a Welch's t-test, not a statistical "
+                "hypothesis test. The caller picks the threshold and owns the "
+                "interpretation."
+            ),
+            "any_input_aborted": len(aborted_inputs) > 0,
+            "aborted_inputs": aborted_inputs,
             "shared_channels": [],
             "only_in_a": [ch for ch in sa.channels if ch not in sb.channels],
             "only_in_b": [ch for ch in sb.channels if ch not in sa.channels],
@@ -490,6 +554,7 @@ class Bench:
                 "mean_shift_z": round(z, 3),
                 "z_threshold_used": z_threshold,
                 "significant_shift": abs(z) > z_threshold,
+                "interpretation": "threshold_gate_on_welch_standard_error",
             }
         return result
 
@@ -534,6 +599,9 @@ class Bench:
                     "n_rows": len(d.get("rows", [])),
                     "channels": d.get("channels", []),
                     "note": d.get("note", ""),
+                    # v0.2.2: partial 情報を search 結果に mirror (list_sessions と同一契約)。
+                    "partial": d.get("aborted_at") is not None,
+                    "abort_reason": d.get("abort_reason"),
                 }
             )
             if len(out) >= limit:
@@ -703,16 +771,27 @@ def compare_sessions(
     """2 つのセッションをチャンネル単位で比較する。
 
     共通する各チャンネルについて mean・stdev・drift の差分を計算し、
-    Welch 型の z スコア (delta_mean / SE) も返す。
+    Welch 型の z スコアを返す。使う式は 1 本だけ:
 
-    判定は呼び出し側の責任 (どちらの id が新しい/基準か + どこで有意判定するか):
+        z = (mean_A - mean_B) / sqrt(sigma_A^2 / n_A + sigma_B^2 / n_B)
+
+    分母は per-sample の SD ではなく平均の標準誤差 (SE) の Welch 合成。
+    そのため n が大きいほど分母が小さくなり、同じ z_threshold=3.0 が
+    n=10 では緩く、n=100 では厳しくなる (n=100 で 「平均が 0.3σ 分ずれ
+    れば z=3」)。この非対称性は仕様。
+
+    判定は呼び出し側の責任 (どちらの id が新しい/基準か + どこで gate するか):
       - `mean_shift_z` は生の z スコア (常に返る)
-      - `significant_shift` は |z| > z_threshold を評価しただけの真偽値
-      - `z_threshold_used` に採用値を反映するので後から audit 可能
+      - `significant_shift` は |z| > z_threshold の真偽値
+      - `z_threshold_used` / `z_formula` に採用値と式を明示
+      - top-level `is_hypothesis_test: false` + `disclaimer` で
+        「これは統計的検定ではない」を機械可読 field として提示
 
     これは Welch's t-test の p 値でも t 分布 CDF による厳密検定でもない。
     「先週と比べて怪しくないか」 判定のための粗い gate である。
     存在しない session_id は structured error dict を返す (例外は投げない)。
+    入力のどちらかが aborted (partial) な場合は top-level の
+    `any_input_aborted: true` + `aborted_inputs: ["a"/"b"]` で通知される。
 
     Args:
         session_id_a: 比較元のセッションID (通常は新しい方)。
@@ -895,6 +974,46 @@ def _selftest() -> int:
     assert 1 <= len(s3.rows) <= fail_after + 1
     partial_hit = Bench.search_sessions(note_contains="selftest-partial", limit=10)
     assert any(h["session_id"] == s3.id for h in partial_hit)
+
+    # [13] partial session が下流 (analyze/plot/compare/search) で消えないこと
+    ana_partial = Bench.analyze(load_session(s3.id))
+    ana_normal = Bench.analyze(load_session(s.id))
+    plot_partial = Bench.plot(load_session(s3.id), width=20)
+    plot_normal = Bench.plot(load_session(s.id), width=20)
+    cmp_asym = Bench.compare(load_session(s.id), load_session(s3.id))
+    cmp_clean = Bench.compare(load_session(s.id), load_session(s2.id))
+    search_all = Bench.search_sessions(note_contains="selftest", limit=100)
+    partial_rows = [h for h in search_all if h["session_id"] == s3.id]
+    normal_rows = [h for h in search_all if h["session_id"] == s.id]
+    print(
+        f"[13] partial downstream: "
+        f"analyze.partial={ana_partial['partial']}/{ana_normal['partial']} "
+        f"plot.partial={plot_partial['partial']}/{plot_normal['partial']} "
+        f"cmp.any_aborted={cmp_asym['any_input_aborted']}/{cmp_clean['any_input_aborted']} "
+        f"cmp.aborted_inputs={cmp_asym['aborted_inputs']} "
+        f"search.partial={partial_rows[0]['partial'] if partial_rows else '?'}/"
+        f"{normal_rows[0]['partial'] if normal_rows else '?'}"
+    )
+    # analyze / plot: partial 情報が top-level に mirror されている
+    assert ana_partial["partial"] is True and ana_normal["partial"] is False
+    assert plot_partial["partial"] is True and plot_normal["partial"] is False
+    assert "RuntimeError" in (ana_partial["abort_reason"] or "")
+    assert "channels_order" in plot_partial and plot_partial["channels_order"]
+    for ch, entry in plot_partial["channels"].items():
+        assert entry["label"] == ch
+    # compare: 非対称入力を top-level で explicit 検出、per-input dict にも partial
+    assert cmp_asym["any_input_aborted"] is True
+    assert cmp_asym["aborted_inputs"] == ["b"]
+    assert cmp_asym["a"]["partial"] is False and cmp_asym["b"]["partial"] is True
+    assert cmp_asym["is_hypothesis_test"] is False
+    assert "z_formula" in cmp_asym and "disclaimer" in cmp_asym
+    for ch_entry in cmp_asym["channels"].values():
+        assert ch_entry["interpretation"] == "threshold_gate_on_welch_standard_error"
+    # clean な 2 セッション同士は any_input_aborted=false、aborted_inputs=[]
+    assert cmp_clean["any_input_aborted"] is False and cmp_clean["aborted_inputs"] == []
+    # search: partial=true/false が各行に立つ
+    assert partial_rows and partial_rows[0]["partial"] is True
+    assert normal_rows and normal_rows[0]["partial"] is False
 
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     return 0

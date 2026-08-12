@@ -4,7 +4,7 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
-**Version**: 0.2.1 (2026-08-13) — v0.2.0 のレビュー指摘に沿った 3 改善: compare_sessions に z_threshold パラメータ明示 (判定責任の外部化) / 無効 session_id を structured error dict で返す / measure の途中失敗を partial 結果として保存。詳細は下記「v0.2 で足したもの」節。
+**Version**: 0.2.2 (2026-08-13) — v0.2.1 のレビュー第 2 波に対応: compare_sessions に z の式そのものを明記 + `is_hypothesis_test: false` / `disclaimer` / `z_formula` / `interpretation` の 4 field で 「これは検定ではない」 を機械可読に固定 / partial session の flag を analyze・plot・compare・search の全下流に mirror (`any_input_aborted` + `aborted_inputs` + 各行 `partial`) / plot_session に `label` + `channels_order` の legend contract を追加。詳細は下記「v0.2 で足したもの」節。
 
 **License**: v0.x は MIT。 v1.0+ は AGPL-3.0 + commercial dual への切替 可能性 予告 (LICENSE file 参照)。 v0.x 分は 永久 MIT (irrevocable)。
 
@@ -56,13 +56,19 @@ T=25.3,H=48.1     →  {"T": 25.3, "H": 48.1}
 **「毎回手でやる面倒」 を 1 つずつ引き受ける** ための 3 ツール。有料化予告済みの機能 (連続ロギング / 閾値アラート / 校正記録) とは非競合の、あくまで基本操作の拡張です。
 
 - **`plot_session`** — Excel を開かずに傾向・外れ値の位置がざっくり見える。matplotlib を入れない (依存を増やさない) ため、Unicode ブロック文字 8 段階で描画。サンプル数が多いときは平均でビン化して幅を合わせる。
-- **`compare_sessions`** — 「先週と比べて怪しくないか」 を AI が数値で判断できるように、2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す。**判定は呼び出し側の責任**: `z_threshold` パラメータ (既定 3.0) を明示指定でき、`significant_shift` は `|z| > z_threshold` を評価しただけ、`z_threshold_used` に採用値が反映されるので後から audit 可能。これは Welch's t-test の p 値でも t 分布 CDF による厳密検定でもない、粗い gate。厳密検定が必要なら生の `mean_shift_z` と `n` を取り出して外部で処理する。
+- **`compare_sessions`** — 「先週と比べて怪しくないか」 を AI が数値で判断できるように、2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す。**使う式は 1 本だけ**: `z = (mean_A − mean_B) / sqrt(σ_A²/n_A + σ_B²/n_B)`。分母は per-sample の SD ではなく **平均の標準誤差 (SE) の Welch 合成** なので、n が大きいほど同じ `z_threshold` が厳しくなる (n=100 なら 「平均が 0.3σ 分ずれれば z=3」)。**判定は呼び出し側の責任**: `z_threshold` パラメータ (既定 3.0) を明示指定でき、`significant_shift` は `|z| > z_threshold` を評価しただけ、`z_threshold_used` / `z_formula` に採用値と式が反映されるので後から audit 可能。これは Welch's t-test の p 値でも t 分布 CDF による厳密検定でもない、粗い gate。厳密検定が必要なら生の `mean_shift_z` と `n` を取り出して外部で処理する。 v0.2.2: `is_hypothesis_test: false` / `disclaimer` / per-channel `interpretation: "threshold_gate_on_welch_standard_error"` を機械可読 field として置き、LLM 側が 「有意です」 と言い換える前に反証できる契約にしている。
 - **`search_sessions`** — `list_sessions` は直近 30 件しか返さないので、`~/.benchtop-mcp/` にセッションが溜まってきたらこちら。since/until (ISO 日時) + note キーワード (大文字小文字無視) + port + channel の AND 絞り込み。
 
 **v0.2.1 の追加改善** (v0.2.0 レビュー指摘対応):
 
 - **`measure` 途中失敗の partial 保存** — 装置切断・Ctrl+C・SerialException 等が起きても、そこまでに取れた行はセッションに保存され、返り値の `partial: true` と `abort_reason` で通知される。100 回中 60 で止まっても「60 行取れた + 止まった理由」が残る。全部捨てるより実運用の失敗解析に使える。
 - **無効 `session_id` の structured error** — 上の tool 表下の注記の通り、例外ではなく dict で返す。
+
+**v0.2.2 の追加改善** (v0.2.1 レビュー指摘対応):
+
+- **`compare_sessions` の z 式明示 + 検定ではないことの機械可読契約** — 上の compare_sessions 説明参照。docstring は人間 (caller) には届くが LLM の出力語彙までは縛れないので、return dict の `is_hypothesis_test: false` + `disclaimer` + per-channel `interpretation` で field 名として置いている。
+- **partial の下流波及** — `Session.aborted_at` が立った session は、`analyze_session` / `plot_session` の top-level に `partial: true` + `abort_reason` を mirror。`compare_sessions` は 2 入力の非対称 n が z を歪めうるので `any_input_aborted: true` + `aborted_inputs: ["a" or "b"]` を top-level に立てる。`search_sessions` / `list_sessions` の各行にも `partial` を出す。中断された session が下流のどの tool を通っても事実が消えない契約。
+- **`plot_session` の legend contract** — per-channel dict に `label: str` (= channel 名) を追加、top-level に `channels_order: [str]` で render 順を明示。§3.5-c で 「どの line が どの channel か」 を目視 verify する際の後方支援。単位 (unit) は v0.3 へ defer 継続。
 
 呼び出し例:
 
@@ -110,13 +116,14 @@ python benchtop_mcp.py --selftest
 [8] compare: shared=['T', 'H', 'V'] T delta_mean=0.146467 z=1.573 significant=False
 [9] search: note='selftest' で 8 件ヒット (s=True, s2=True)
 [10] invalid id → structured error='session_not_found' / 有効 id → Session OK
-[11] compare threshold: |z|=1.573 strict(3.0)=False loose(0.5)=True
+[11] compare threshold: |z|=1.797 strict(3.0)=False loose(0.5)=True
 [12] partial measurement: n_rows=5/20 aborted=True reason='RuntimeError: simulated device failure after 5 reads'
+[13] partial downstream: analyze.partial=True/False plot.partial=True/False cmp.any_aborted=True/False cmp.aborted_inputs=['b'] search.partial=True/False
 
 全テスト成功。実機が無くてもこのサーバーは動作します。
 ```
 
-数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜12) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
+数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜13) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
 
 ### 3. Claude Desktop に登録する
 
