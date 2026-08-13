@@ -4,9 +4,11 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
-**Version**: 0.2.3 (2026-08-13) — v0.2.2 のレビュー第 3 波に対応: compare_sessions の docstring から 「Welch's t-test ではない」 の自己矛盾を撤回 (statistic は Welch t と同一、 異なるのは判定則) / `welch_df` (Welch-Satterthwaite 自由度) を per-channel に露出、caller が固定閾値の calibration を判断可能に / `n<2` (insufficient_samples) と `σ 合成=0` (zero_variance) の 2 guard を導入 (旧実装は 0/0→NaN→significant_shift=False の 「差が無い」 と静かに誤報していた path)。詳細は下記「v0.2 で足したもの」節。
+**Version**: 0.2.4 (2026-08-13) — v0.2.3 verify 中に発火した実 pain 対応 (initial external-verify-derived fix): `search_sessions` の `since` / `until` が `YYYY-MM-DD` (時刻部分なし) のとき **local midnight として解釈** し UTC 換算後に比較。旧 v0.2.3 では UTC 文字列辞書順比較で 「JST 早朝に測った session を `since='今日'` で 検索すると 0 件」 の 静かな穴があった (session_id は JST 表示 / started_at は UTC で日付が 1 日ずれる)。完全 ISO (T + offset) は従来通り厳密。`BENCHTOP_TZ` env で tz override 可能。副 fix として各 tool の返り値に `started_at_local` を併記。詳細は下記「v0.2 で足したもの」節。
 
 **Compatibility note**: v0.2.3 は `interpretation` field の値を `"threshold_gate_on_welch_standard_error"` (v0.2.2) → `"welch_t_statistic_with_fixed_z_threshold"` に rename しました。この文字列を pattern match していた caller は壊れます。現時点で外部 caller はいない想定なので実害ゼロですが、今後 return dict の field 値を触るときは breaking change 扱いとします (メジャー版 or 明示注記の伴う変更のみ)。
+
+v0.2.4 は `search_sessions(since='YYYY-MM-DD')` の 解釈を **UTC 文字列辞書順比較 → local midnight 換算比較** に変更しています。厳密には behavior change ですが、「UTC 基準の日付のみ指定」を意図して使っていた caller は現実には存在しない想定 (いたとすればそれが今回のバグ) なので breaking 扱いはしません。完全 ISO 指定 (`T` + 時刻 + offset) は従来動作を維持。
 
 **License**: v0.x は MIT。 v1.0+ は AGPL-3.0 + commercial dual への切替 可能性 予告 (LICENSE file 参照)。 v0.x 分は 永久 MIT (irrevocable)。
 
@@ -78,6 +80,16 @@ T=25.3,H=48.1     →  {"T": 25.3, "H": 48.1}
 - **partial の下流波及** — `Session.aborted_at` が立った session は、`analyze_session` / `plot_session` の top-level に `partial: true` + `abort_reason` を mirror。`compare_sessions` は 2 入力の非対称 n が z を歪めうるので `any_input_aborted: true` + `aborted_inputs: ["a" or "b"]` を top-level に立てる。`search_sessions` / `list_sessions` の各行にも `partial` を出す。中断された session が下流のどの tool を通っても事実が消えない契約。
 - **`plot_session` の legend contract** — per-channel dict に `label: str` (= channel 名) を追加、top-level に `channels_order: [str]` で render 順を明示。§3.5-c で 「どの line が どの channel か」 を目視 verify する際の後方支援。単位 (unit) は v0.3 へ defer 継続。
 
+**v0.2.4 の追加改善** (v0.2.3 実 verify 発火の pain fix、 initial **external-verify-derived** 変更):
+
+- **`search_sessions` の date-only 解釈を local midnight 化** — 藤本さん が v0.2.3 verify 中 §3.5-b/c 全 pass 直後 に発見した 実 pain。 session_id は local time (JST) 表示、 started_at は UTC 保存で 日付が 1 日ずれる → `since='2026-08-13', note_contains='seed'` で **0 件** (今日作った session を 「今日以降」 で検索すると 消える)。 v0.2.4 では `YYYY-MM-DD` 形式 (時刻部分なし) を検出し **local midnight として解釈** し UTC 換算 (`since` = 当日 00:00 local、 `until` = 当日 23:59:59.999999 local)。 「今日以降と書いたら 手元の時計で今日 0 時以降が返る」 直感一致。 完全 ISO (`T` + 時刻 [+ offset]) は 従来通り 厳密比較。 tz は `BENCHTOP_TZ` env 優先、 無ければ system local。
+- **`filters` に audit trail 併記** — 返り値の `filters` に `since_resolved_utc` / `until_resolved_utc` / `since_date_only` / `until_date_only` / `tz_used` を 追加。 「意図した通り 解釈されたか」 が 機械可読で 確認可能。
+- **`started_at_local` 副 field を 各 tool に追加** (副役割、 主 fix と 独立)。 `search_sessions` / `list_sessions` 各 row + `analyze_session` / `plot_session` top-level + `compare_sessions` の a/b 各 input dict。 空振り時は 見えない (副役割の 明確化) が、 検索成功後に 日時を 読む時に 便利。
+
+**v0.2.4 で 明示 defer した もの** (「隠す」 選択の 意味論設計先要): `plot_session` の 外れ値で スケール潰れ (3% 外れ値機構の 1 点が最大値になると 残り 29 点が最下段に潰れる) は sparkline の 数学的性質 (min/max 正規化) の限界。 percentile clip や 外れ値別記号は 「clip した」 事実の どう明示するかの 設計判断が 追加で必要 = v0.2.5+ or 別 tool (`plot_session_clipped`) 候補。 現状は `analyze_session` の `outliers` field で 外れ値 位置 + magnitude は 取れる (併用推奨)。
+
+---
+
 **v0.2.3 の追加改善** (v0.2.2 レビュー指摘対応):
 
 - **compare docstring の自己矛盾撤回** — v0.2.2 は 「これは Welch's t-test ではない」 と書いていたが、上の式が示す通り statistic は Welch t そのもの。訂正: 「statistic は Welch t と同一、異なるのは判定則 (df 依存 critical value vs 固定閾値)」 と書き分け。per-channel `interpretation` string も `"threshold_gate_on_welch_standard_error"` → `"welch_t_statistic_with_fixed_z_threshold"` に更新。
@@ -136,11 +148,15 @@ python benchtop_mcp.py --selftest
 [14a] zero variance guard: evaluable=False reason=zero_variance z=None sig=None df=None
 [14b] insufficient n guard: evaluable=False reason=insufficient_samples n_a=1 n_b=60
 [14c] guard 独立性: 正常 case (phase [11] 再利用) evaluable=True 対 guard case evaluable=False
+[15a] date-only 'since=2026-08-13' → resolved_utc=2026-08-12T15:00:00+00:00 date_only=True tz=Asia/Tokyo
+[15b] full ISO 'since=2026-08-13T00:00:00+00:00' → resolved_utc=2026-08-13T00:00:00+00:00 date_only=False
+[15c] JST 早朝 session (started=2026-08-12T15:30:00+00:00) が since='2026-08-13' で 拾える → found=True (旧 v0.2.3 では 拾えなかった)
+[15d] started_at_local 補助 field: search[0]=2026-08-13T00:30:00+09:00 analyze=2026-08-13T00:30:00+09:00 (JST +09:00 一貫)
 
 全テスト成功。実機が無くてもこのサーバーは動作します。
 ```
 
-数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜14) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。
+数値はランダム性で毎回変わりますが、行の形と phase 数 (1〜15) が一致し、末尾が「全テスト成功」で終われば正常です。Windows の `cp932` 端末でも Unicode スパークラインが表示できるよう、selftest 内で stdout を UTF-8 に切り替えています。phase [15] は `BENCHTOP_TZ='Asia/Tokyo'` を test 内で 一時的に設定 (finally で復元) して tz 依存を 固定しています。
 
 ### 3. Claude Desktop に登録する
 

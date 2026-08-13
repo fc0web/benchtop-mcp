@@ -54,9 +54,97 @@ MOCK_PORT = "mock"
 # v0.2: plot_session 用スパークライン文字 (8 段階、空白は使わない)
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
+# v0.2.4: date-only 検出用 (YYYY-MM-DD、T なし)
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    _HAS_ZONEINFO = True
+except ImportError:  # pragma: no cover
+    _HAS_ZONEINFO = False
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _resolve_tz() -> tuple[Any, str]:
+    """BENCHTOP_TZ env が指定されていればそれを、無ければ system local を返す。
+    戻り値は (tzinfo, name) タプル。zoneinfo が使えない環境や tz name 解決失敗時は
+    system local に fallback (name='local')。
+    """
+    tz_name = os.environ.get("BENCHTOP_TZ", "").strip()
+    if tz_name and _HAS_ZONEINFO:
+        try:
+            return ZoneInfo(tz_name), tz_name
+        except Exception:
+            pass  # 無効 tz name は fallback
+    local = datetime.now().astimezone().tzinfo
+    return local, "local"
+
+
+def _to_local_iso(utc_iso: str | None) -> str | None:
+    """UTC ISO 文字列 (started_at 由来) を local ISO 文字列に換算。
+    v0.2.4 副 fix: 各 tool の return dict に補助 field として併記するため。
+    主 fix (date-only local 解釈) と 独立に働く。
+    """
+    if not utc_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(utc_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        tz, _ = _resolve_tz()
+        return dt.astimezone(tz).isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+def _resolve_date_boundary(
+    s: str | None, is_since: bool
+) -> tuple[str | None, dict[str, Any]]:
+    """search_sessions の since/until を解決する。
+
+    v0.2.4 主 fix (藤本さん 2026-08-13 verify で 発火):
+      - 日付のみ文字列 (YYYY-MM-DD、時刻部分なし) は **local midnight** として
+        解釈し、UTC に換算して返す。since は当日 00:00 local、until は当日
+        23:59:59.999999 local (day-end inclusive)。
+      - 完全 ISO (T + 時刻 [+ offset]) はそのまま返す (従来通り厳密比較)。
+      - 換算失敗時は元文字列にfallback (data 破壊しない)。
+
+    Returns:
+        (resolved_utc_iso_or_original, meta_dict) の tuple。
+        meta_dict は {input, date_only, resolved_utc, tz_used}。
+    """
+    meta: dict[str, Any] = {
+        "input": s,
+        "date_only": False,
+        "resolved_utc": s,
+        "tz_used": None,
+    }
+    if s is None:
+        return None, meta
+    s = s.strip()
+    if not s:
+        return s, meta
+    if not _DATE_ONLY_RE.match(s):
+        # 完全 ISO or 未認識形式 → そのまま比較 (従来動作)
+        return s, meta
+    # 日付のみ path
+    try:
+        tz, tz_name = _resolve_tz()
+        y, m, day = int(s[0:4]), int(s[5:7]), int(s[8:10])
+        if is_since:
+            local_dt = datetime(y, m, day, 0, 0, 0, 0, tzinfo=tz)
+        else:
+            local_dt = datetime(y, m, day, 23, 59, 59, 999999, tzinfo=tz)
+        utc_iso = local_dt.astimezone(timezone.utc).isoformat()
+        meta["date_only"] = True
+        meta["resolved_utc"] = utc_iso
+        meta["tz_used"] = tz_name
+        return utc_iso, meta
+    except Exception:
+        return s, meta
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +410,8 @@ class Bench:
             "session_id": session.id,
             "port": session.port,
             "started_at": session.started_at,
+            # v0.2.4 副 fix: local tz 補助
+            "started_at_local": _to_local_iso(session.started_at),
             "note": session.note,
             "n_rows": len(session.rows),
             "skipped": session.skipped,
@@ -381,11 +471,14 @@ class Bench:
         for p in sorted(DATA_DIR.glob("*.json"), reverse=True)[:limit]:
             try:
                 d = json.loads(p.read_text(encoding="utf-8"))
+                started = d["started_at"]
                 out.append(
                     {
                         "session_id": d["id"],
                         "port": d["port"],
-                        "started_at": d["started_at"],
+                        "started_at": started,
+                        # v0.2.4 副 fix: local tz 補助表示 (system local or BENCHTOP_TZ)
+                        "started_at_local": _to_local_iso(started),
                         "n_rows": len(d.get("rows", [])),
                         "channels": d.get("channels", []),
                         "note": d.get("note", ""),
@@ -417,6 +510,8 @@ class Bench:
             "session_id": session.id,
             "port": session.port,
             "started_at": session.started_at,
+            # v0.2.4 副 fix: local tz 補助
+            "started_at_local": _to_local_iso(session.started_at),
             "width": width,
             "n_rows": len(session.rows),
             "partial": session.aborted_at is not None,
@@ -517,6 +612,8 @@ class Bench:
             "a": {
                 "session_id": sa.id,
                 "started_at": sa.started_at,
+                # v0.2.4 副 fix: local tz 補助
+                "started_at_local": _to_local_iso(sa.started_at),
                 "note": sa.note,
                 "port": sa.port,
                 "partial": sa.aborted_at is not None,
@@ -525,6 +622,8 @@ class Bench:
             "b": {
                 "session_id": sb.id,
                 "started_at": sb.started_at,
+                # v0.2.4 副 fix: local tz 補助
+                "started_at_local": _to_local_iso(sb.started_at),
                 "note": sb.note,
                 "port": sb.port,
                 "partial": sb.aborted_at is not None,
@@ -619,13 +718,44 @@ class Bench:
         port: str | None = None,
         channel: str | None = None,
         limit: int = 30,
+        _meta_out: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """条件付きでセッションを絞り込む。list_sessions が直近 N 件しか
-        返さないので、セッションが増えたらこちらを使う。全条件 AND、
-        started_at は ISO 文字列辞書順で比較 (UTC 保存前提)。
+        返さないので、セッションが増えたらこちらを使う。全条件 AND。
+
+        v0.2.4 主 fix (藤本さん 2026-08-13 verify 発火 pain fix):
+          - `since` / `until` が **日付のみ文字列** (`YYYY-MM-DD`) のときは
+            **local midnight として解釈** し UTC 換算後に started_at と比較。
+            since=当日 00:00 local、until=当日 23:59:59.999999 local。
+          - 完全 ISO (T + 時刻 [+ offset]) はそのまま辞書順比較 (従来動作)。
+          - tz は `BENCHTOP_TZ` env 優先、無ければ system local。
+          - `_meta_out` (optional dict) に resolve 結果を書き戻すので、
+            MCP tool 層で audit trail (`since_resolved_utc` 等) を返せる。
+            渡さない caller (旧 selftest phase [9] 等) は backward compat。
         """
         if not DATA_DIR.exists():
+            if _meta_out is not None:
+                _meta_out["since"] = since
+                _meta_out["until"] = until
+                _meta_out["since_resolved_utc"] = since
+                _meta_out["until_resolved_utc"] = until
+                _meta_out["since_date_only"] = False
+                _meta_out["until_date_only"] = False
+                _meta_out["tz_used"] = None
             return []
+
+        # v0.2.4: since/until を resolve
+        resolved_since, meta_since = _resolve_date_boundary(since, True)
+        resolved_until, meta_until = _resolve_date_boundary(until, False)
+        if _meta_out is not None:
+            _meta_out["since"] = since
+            _meta_out["until"] = until
+            _meta_out["since_resolved_utc"] = meta_since["resolved_utc"]
+            _meta_out["until_resolved_utc"] = meta_until["resolved_utc"]
+            _meta_out["since_date_only"] = meta_since["date_only"]
+            _meta_out["until_date_only"] = meta_until["date_only"]
+            _meta_out["tz_used"] = meta_since["tz_used"] or meta_until["tz_used"]
+
         needle = note_contains.lower() if note_contains else None
         out: list[dict[str, Any]] = []
         for p in sorted(DATA_DIR.glob("*.json"), reverse=True):
@@ -634,9 +764,9 @@ class Bench:
             except Exception:
                 continue
             started = d.get("started_at", "")
-            if since and started < since:
+            if resolved_since and started < resolved_since:
                 continue
-            if until and started > until:
+            if resolved_until and started > resolved_until:
                 continue
             if port and d.get("port") != port:
                 continue
@@ -649,6 +779,8 @@ class Bench:
                     "session_id": d["id"],
                     "port": d["port"],
                     "started_at": started,
+                    # v0.2.4 副 fix: local tz 補助表示
+                    "started_at_local": _to_local_iso(started),
                     "n_rows": len(d.get("rows", [])),
                     "channels": d.get("channels", []),
                     "note": d.get("note", ""),
@@ -675,13 +807,14 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.2.0",
+    version="0.2.4",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
         "典型的な流れ: list_ports → measure → analyze_session → export_session_csv。"
         "v0.2 追加: plot_session (ASCII 波形) / compare_sessions (2 セッション diff) / "
-        "search_sessions (日付・note・port・channel での絞り込み)。"
+        "search_sessions (日付・note・port・channel での絞り込み、"
+        "v0.2.4 で 'YYYY-MM-DD' の日付のみ指定は local midnight として解釈)。"
     ),
 )
 
@@ -880,27 +1013,48 @@ def search_sessions(
     """保存済みセッションを条件で絞り込む。
 
     list_sessions は直近 N 件しか返さないので、セッションが増えたらこちらを
-    使う。全条件 AND、started_at は ISO 文字列辞書順で比較 (UTC 保存前提)。
+    使う。全条件 AND。
+
+    **v0.2.4 date-only 解釈** (藤本さん 2026-08-13 verify 発火 pain fix):
+    since / until が `YYYY-MM-DD` 形式 (時刻部分なし) のとき、**local
+    midnight として解釈** し UTC 換算後に比較する。since=当日 00:00 local、
+    until=当日 23:59:59.999999 local。つまり `since='2026-08-13'` は
+    「手元の時計で 8/13 以降」 と直感的に一致する。時刻 + offset まで書いた
+    完全 ISO 文字列 (例 `'2026-08-13T00:00:00+09:00'`) は従来通り厳密比較。
+    tz は `BENCHTOP_TZ` env 優先、無ければ system local。
+
+    返り値の `filters` に `since_resolved_utc` / `until_resolved_utc` /
+    `since_date_only` / `until_date_only` / `tz_used` を併記するので、
+    「意図した通り解釈されたか」 は audit trail から確認できる。
 
     Args:
-        since: この日時以降のみ (ISO 形式、例 '2026-08-01' or '2026-08-01T00:00:00+00:00')。
-        until: この日時以前のみ (ISO 形式)。
+        since: この日時以降のみ。'YYYY-MM-DD' なら local midnight、完全 ISO なら厳密。
+        until: この日時以前のみ。'YYYY-MM-DD' なら local day-end、完全 ISO なら厳密。
         note_contains: note に含まれる文字列 (大文字小文字を区別しない)。
         port: このポートで計測したものだけ (完全一致)。
         channel: このチャンネルを含むものだけ (例: 'T', 'V', 'ch1')。
         limit: 返す最大件数。既定は 30。
     """
+    meta: dict[str, Any] = {}
+    sessions = Bench.search_sessions(
+        since, until, note_contains, port, channel, limit, _meta_out=meta
+    )
     return {
         "data_dir": str(DATA_DIR),
         "filters": {
             "since": since,
+            "since_resolved_utc": meta.get("since_resolved_utc"),
+            "since_date_only": meta.get("since_date_only", False),
             "until": until,
+            "until_resolved_utc": meta.get("until_resolved_utc"),
+            "until_date_only": meta.get("until_date_only", False),
             "note_contains": note_contains,
             "port": port,
             "channel": channel,
             "limit": limit,
+            "tz_used": meta.get("tz_used"),
         },
-        "sessions": Bench.search_sessions(since, until, note_contains, port, channel, limit),
+        "sessions": sessions,
     }
 
 
@@ -1084,6 +1238,8 @@ def _selftest() -> int:
     assert partial_rows and partial_rows[0]["partial"] is True
     assert normal_rows and normal_rows[0]["partial"] is False
 
+    # [15] は下でまとめて置く (guard 系 [14] の後)。 順序: [10]-[13] partial 系 → [14] guard 系 → [15] date-only 系。
+
     # [14] compare guard: zero_variance と insufficient_samples の 2 case
     # 旧実装 (v0.2.2 以前) では σ=0 で 0/0→NaN→significant_shift=False に落ちる
     # 「静かな bug」 が存在。v0.2.3 で明示 guard に分離。
@@ -1147,6 +1303,73 @@ def _selftest() -> int:
     )
     assert cmp_strict["channels"]["T"]["gate_evaluable"] is True
     assert cmp_zv["channels"]["V"]["gate_evaluable"] is False
+
+    # [15] date-only since/until local 解釈 (v0.2.4 主 fix、 藤本さん 2026-08-13 verify 発火 pain)
+    # 「JST 早朝に測った session が since='当日' で 消える」 pain を 再現 + fix verify。
+    # test 内 env 変更は 元値保存 + finally 復元 (副作用ゼロ)。
+    old_tz = os.environ.get("BENCHTOP_TZ")
+    try:
+        # JST 固定 (どの環境でも 同じ結果)
+        os.environ["BENCHTOP_TZ"] = "Asia/Tokyo"
+
+        # [15a] date-only since は local midnight として解釈される
+        meta_a: dict[str, Any] = {}
+        Bench.search_sessions(since="2026-08-13", limit=1, _meta_out=meta_a)
+        print(
+            f"[15a] date-only 'since=2026-08-13' → resolved_utc={meta_a['since_resolved_utc']} "
+            f"date_only={meta_a['since_date_only']} tz={meta_a['tz_used']}"
+        )
+        assert meta_a["since_date_only"] is True
+        assert meta_a["tz_used"] == "Asia/Tokyo"
+        # JST 8/13 00:00 = UTC 8/12 15:00
+        assert meta_a["since_resolved_utc"].startswith("2026-08-12T15:00:00")
+
+        # [15b] 完全 ISO は 従来通り 厳密 (resolve せず そのまま)
+        meta_b: dict[str, Any] = {}
+        Bench.search_sessions(since="2026-08-13T00:00:00+00:00", limit=1, _meta_out=meta_b)
+        print(
+            f"[15b] full ISO 'since=2026-08-13T00:00:00+00:00' → "
+            f"resolved_utc={meta_b['since_resolved_utc']} date_only={meta_b['since_date_only']}"
+        )
+        assert meta_b["since_date_only"] is False
+        assert meta_b["since_resolved_utc"] == "2026-08-13T00:00:00+00:00"
+
+        # [15c] 藤本さん verify 発火 case 再現: JST 早朝 session が since='当日' で 拾える
+        # started_at を JST 8/13 00:30 (= UTC 8/12 15:30) で fake session を作る
+        fake_started_utc = "2026-08-12T15:30:00+00:00"
+        fake_id = "20260813-003000-999"
+        fake_session = Session(
+            id=fake_id, port=MOCK_PORT, started_at=fake_started_utc, note="selftest-jst-early",
+            channels=["T"], rows=[{"t": 0.0, "T": 25.0}],
+        )
+        fake_session.save()
+        hits = Bench.search_sessions(since="2026-08-13", note_contains="selftest-jst-early", limit=10)
+        found = any(h["session_id"] == fake_id for h in hits)
+        print(
+            f"[15c] JST 早朝 session (started={fake_started_utc}) が "
+            f"since='2026-08-13' で 拾える → found={found} (旧 v0.2.3 では 拾えなかった)"
+        )
+        assert found is True, "v0.2.4 主 fix (date-only local 解釈) が 効いていない"
+
+        # [15d] started_at_local 補助 field 各 tool で 出る
+        hits2 = Bench.search_sessions(note_contains="selftest-jst-early", limit=5)
+        assert hits2 and "started_at_local" in hits2[0]
+        assert hits2[0]["started_at_local"] and "+09:00" in hits2[0]["started_at_local"]
+        ana_local = Bench.analyze(load_session(fake_id))
+        assert "started_at_local" in ana_local and "+09:00" in ana_local["started_at_local"]
+        plot_local = Bench.plot(load_session(fake_id), width=5)
+        assert "started_at_local" in plot_local and "+09:00" in plot_local["started_at_local"]
+        cmp_local = Bench.compare(load_session(fake_id), load_session(s.id))
+        assert "started_at_local" in cmp_local["a"] and "+09:00" in cmp_local["a"]["started_at_local"]
+        print(
+            f"[15d] started_at_local 補助 field: search[0]={hits2[0]['started_at_local']} "
+            f"analyze={ana_local['started_at_local']} (JST +09:00 一貫)"
+        )
+    finally:
+        if old_tz is None:
+            os.environ.pop("BENCHTOP_TZ", None)
+        else:
+            os.environ["BENCHTOP_TZ"] = old_tz
 
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     return 0
