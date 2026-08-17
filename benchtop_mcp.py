@@ -798,6 +798,39 @@ BENCH = Bench()
 
 
 # ---------------------------------------------------------------------------
+# v0.3.0: audit log hash chain (Rei-Automator STEP 1340 primitive port)
+#   session store (~/.benchtop-mcp/session_*.json) と独立の説明責任 store。
+#   全 tool 呼び出しを append-only JSONL + sha256 prev-hash chain で記録。
+#   証跡が価値になる領域 (ISO/IEC 17025 校正 / GMP 医薬品製造記録 / 監査対応) 用。
+# ---------------------------------------------------------------------------
+
+from benchtop_audit_log import AuditLogWriter  # noqa: E402
+
+AUDIT_DIR = Path(os.environ.get("BENCHTOP_AUDIT_DIR", str(DATA_DIR / "audit")))
+_AUDIT_ENABLED = os.environ.get("BENCHTOP_AUDIT", "1").strip() not in ("0", "false", "no", "")
+_AUDIT: AuditLogWriter | None = None
+if _AUDIT_ENABLED:
+    try:
+        _AUDIT = AuditLogWriter(str(AUDIT_DIR))
+    except Exception as e:
+        # audit init 失敗は log のみ、 tool 実行を kill しない
+        print(f"[benchtop] audit log init failed: {e}", file=sys.stderr)
+        _AUDIT = None
+
+
+def _write_audit(action: str, target: str, result: str = "success",
+                 detail: dict[str, Any] | None = None) -> None:
+    """Append audit entry. Failure is swallowed with warn — tool exec must continue."""
+    if _AUDIT is None:
+        return
+    try:
+        _AUDIT.append(actor="benchtop-mcp", action=action, target=target,
+                      result=result, detail=detail)
+    except Exception as e:
+        print(f"[benchtop] audit append failed: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # MCP 層 : ここから下が「AI から呼べる道具」の定義
 #   関数の docstring と型注釈が、そのまま AI への説明書になる。
 #   ここを丁寧に書くほど AI は正しく使ってくれる。
@@ -807,7 +840,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.2.4",
+    version="0.3.0",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -815,6 +848,9 @@ server = MCPServer(
         "v0.2 追加: plot_session (ASCII 波形) / compare_sessions (2 セッション diff) / "
         "search_sessions (日付・note・port・channel での絞り込み、"
         "v0.2.4 で 'YYYY-MM-DD' の日付のみ指定は local midnight として解釈)。"
+        "v0.3.0 追加: audit log hash chain (append-only JSONL + sha256 prev-hash)。"
+        "全 tool 呼び出しが 記録され、verify_audit_chain で 改竄検出可能。"
+        "証跡が価値になる領域 (ISO/IEC 17025 / GMP / 監査対応) 用。"
     ),
 )
 
@@ -873,7 +909,7 @@ def measure(
         のとき部分結果 (abort_reason に理由)。
     """
     s = BENCH.measure(port, samples, interval_ms, baudrate, command, note)
-    return {
+    result = {
         "session_id": s.id,
         "saved_to": str(s.path()),
         "n_rows": len(s.rows),
@@ -883,6 +919,18 @@ def measure(
         "abort_reason": s.abort_reason,
         "summary": Bench.analyze(s)["channels"],
     }
+    # v0.3.0: audit log
+    _write_audit(
+        action="measure",
+        target=s.id,
+        result="partial" if s.aborted_at else "success",
+        detail={
+            "port": port, "samples_requested": samples, "n_rows": len(s.rows),
+            "channels": s.channels, "note": note,
+            "abort_reason": s.abort_reason if s.aborted_at else None,
+        },
+    )
+    return result
 
 
 @server.tool()
@@ -918,9 +966,14 @@ def export_session_csv(session_id: str, out_path: str) -> dict[str, Any]:
     """
     s = _load_session_or_error(session_id)
     if isinstance(s, dict):
+        _write_audit(action="export_session_csv", target=session_id, result="error",
+                     detail={"error": s.get("error"), "out_path": out_path})
         return s
     p = Bench.export_csv(s, out_path)
-    return {"session_id": session_id, "path": str(p), "n_rows": len(s.rows), "columns": ["t"] + s.channels}
+    result = {"session_id": session_id, "path": str(p), "n_rows": len(s.rows), "columns": ["t"] + s.channels}
+    _write_audit(action="export_session_csv", target=session_id, result="success",
+                 detail={"path": str(p), "n_rows": len(s.rows)})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -994,11 +1047,19 @@ def compare_sessions(
     """
     a = _load_session_or_error(session_id_a)
     if isinstance(a, dict):
+        _write_audit(action="compare_sessions", target=f"{session_id_a}|{session_id_b}",
+                     result="error", detail={"error": a.get("error"), "which": "a"})
         return a
     b = _load_session_or_error(session_id_b)
     if isinstance(b, dict):
+        _write_audit(action="compare_sessions", target=f"{session_id_a}|{session_id_b}",
+                     result="error", detail={"error": b.get("error"), "which": "b"})
         return b
-    return Bench.compare(a, b, z_threshold)
+    result = Bench.compare(a, b, z_threshold)
+    _write_audit(action="compare_sessions", target=f"{session_id_a}|{session_id_b}",
+                 result="success",
+                 detail={"z_threshold": z_threshold, "n_a": len(a.rows), "n_b": len(b.rows)})
+    return result
 
 
 @server.tool()
@@ -1056,6 +1117,38 @@ def search_sessions(
         },
         "sessions": sessions,
     }
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0: audit log verify tool
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def verify_audit_chain(audit_dir: str | None = None) -> dict[str, Any]:
+    """audit log の sha256 prev-hash chain 整合性を検証する (v0.3.0)。
+
+    audit log は 全 tool 呼び出しの 説明責任 (accountability) 記録で、
+    append-only JSONL に sha256 prev-hash を 埋め込む形で改竄検出可能。
+    各行は 前行の sha256 を `prev` field に含み、 一行でも 内容を書き換えると
+    後続 line の prev と 不一致になる。
+
+    証跡が価値になる領域 (ISO/IEC 17025 校正 / GMP 医薬品製造記録 /
+    監査対応) 用途で、 「この時期の 計測結果は 事後改竄されていない」 を
+    機械的に verify する 一次手段。
+
+    Args:
+        audit_dir: 検証対象の audit log dir。 省略時は BENCHTOP_AUDIT_DIR env
+                   or `~/.benchtop-mcp/audit`。
+
+    Returns:
+        {"valid": True, "total": N} — chain 完全 (N 件の entry 全て 整合)
+        {"valid": False, "broken_at": i, "total": N} — line i (0-indexed) で
+          chain 破断検出、 それ以前は 整合、 それ以降は 未検証
+        {"valid": True, "total": 0} — audit log 未生成 (integrity としては vacuously true)
+    """
+    target_dir = audit_dir if audit_dir is not None else str(AUDIT_DIR)
+    return AuditLogWriter.verify_chain(target_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +1463,58 @@ def _selftest() -> int:
             os.environ.pop("BENCHTOP_TZ", None)
         else:
             os.environ["BENCHTOP_TZ"] = old_tz
+
+    # [16] audit log hash chain verify (v0.3.0 主 fix、 Rei-Automator STEP 1340 primitive port)
+    # session store と 別 store で 全 tool 呼び出しの 説明責任 記録、 改竄検出可能。
+    import tempfile
+    from benchtop_audit_log import AuditLogWriter as _AL
+    with tempfile.TemporaryDirectory(prefix="benchtop-audit-selftest-") as _tmpdir:
+        # [16a] genesis chain: 3 entry 追加 → verify PASS
+        w = _AL(_tmpdir)
+        h1 = w.append(actor="selftest", action="measure", target="fake-1", result="success",
+                      detail={"n": 10})
+        h2 = w.append(actor="selftest", action="compare_sessions", target="fake-1|fake-2",
+                      result="success", detail={"z_threshold": 3.0})
+        h3 = w.append(actor="selftest", action="export_session_csv", target="fake-1",
+                      result="success", detail={"path": "/tmp/x.csv"})
+        chk1 = _AL.verify_chain(_tmpdir)
+        print(f"[16a] genesis chain 3 entries: valid={chk1['valid']} total={chk1['total']} "
+              f"head_prefix={h3[:16]}")
+        assert chk1["valid"] is True
+        assert chk1["total"] == 3
+
+        # [16b] chain continuation: 新 writer instance で 続き append → PASS
+        w2 = _AL(_tmpdir)
+        assert w2.get_head() == h3, "new instance が 前 head を loadできていない"
+        h4 = w2.append(actor="selftest", action="measure", target="fake-2",
+                       result="partial", detail={"abort_reason": "test"})
+        chk2 = _AL.verify_chain(_tmpdir)
+        print(f"[16b] chain continuation: new instance loaded head={h3[:16]}, "
+              f"appended → valid={chk2['valid']} total={chk2['total']}")
+        assert chk2["valid"] is True
+        assert chk2["total"] == 4
+
+        # [16c] tamper detection: 中間 line の target を書き換え → verify で 検出
+        audit_path = Path(_tmpdir) / "audit.jsonl"
+        raw = audit_path.read_text(encoding="utf-8")
+        lines = [ln for ln in raw.split("\n") if ln.strip()]
+        entry_0 = json.loads(lines[0])
+        entry_0["target"] = "TAMPERED"
+        lines[0] = json.dumps(entry_0, ensure_ascii=False, separators=(",", ":"))
+        audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        chk3 = _AL.verify_chain(_tmpdir)
+        print(f"[16c] tamper detection: modified line 0 → valid={chk3['valid']} "
+              f"broken_at={chk3.get('broken_at')} total={chk3['total']}")
+        assert chk3["valid"] is False
+        assert chk3["broken_at"] == 1, f"想定 broken_at=1 (line 0 hash 変化 → line 1 prev mismatch) だが {chk3.get('broken_at')}"
+
+        # [16d] MCP tool level verify_audit_chain (tempdir 対象): 直後 valid (tamper 済 なので false)
+        # 上の tamper 状態で MCP tool を 呼び出して 同結果か 確認
+        chk4 = verify_audit_chain(audit_dir=_tmpdir)
+        print(f"[16d] MCP tool verify_audit_chain(audit_dir={_tmpdir[-30:]}): "
+              f"valid={chk4['valid']} broken_at={chk4.get('broken_at')}")
+        assert chk4["valid"] is False
+        assert chk4.get("broken_at") == 1
 
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     return 0
