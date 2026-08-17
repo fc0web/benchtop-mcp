@@ -4,6 +4,8 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
+**Version**: 0.4.0 (2026-08-17) — **★ 実験ノート (experiment notebook) 統合**: Session dataclass に `subject` (被測定物 ID) / `environment` (温湿度 dict) / `instrument_config` (装置設定 dict) / `mystery_id` (rei-aios link) 全 optional field 追加。 新 tool 2 個: `find_similar_sessions` (subject / mystery_id / environment key/value + tolerance で 過去 session 絞り込み) + `regression_check` (baseline vs current の mean_delta / stdev_ratio tolerance-based 劣化検出)。 chat-Claude 2026-08-17 arc 「実験ノート MCP」 提案 (benchtop = 手を動かす、 rei-aios = 考える、 その間の 空白) を benchtop 内 拡張として 実装 (新 MCP 追加せず 「深化」 discipline 準拠)。 backward compat: 旧 JSON (v0.3.0 以前) も 読める、 新 field default None。 selftest phase [17] (実験ノート + find_similar_sessions 5 case) + [18a-18c] (regression_check 3 case) 追加、 計 18 phase 全 PASS。
+
 **Version**: 0.3.0 (2026-08-17) — **★ major: audit log hash chain 追加** (Rei-Automator STEP 1340 primitive port)。 全 tool 呼び出しが `~/.benchtop-mcp/audit/audit.jsonl` に append-only JSONL + sha256 prev-hash chain で 記録され、 新 tool `verify_audit_chain` で 改竄検出可能。 chat-Claude 2026-08-17 arc 「証跡が価値になる領域」 (ISO/IEC 17025 校正 / GMP 医薬品製造記録 / 監査対応) 用途。 session store (`~/.benchtop-mcp/session_*.json`) と 別 store で 併存、 audit log は 削除禁止 (append-only)。 `BENCHTOP_AUDIT=0` で 無効化可能、 `BENCHTOP_AUDIT_DIR` で 保存先変更可能。 selftest phase [16a-16d] で genesis chain / continuation / tamper detection / MCP tool level を 各 verify。
 
 **Version**: 0.2.4 (2026-08-13) — v0.2.3 verify 中に発火した実 pain 対応 (initial external-verify-derived fix): `search_sessions` の `since` / `until` が `YYYY-MM-DD` (時刻部分なし) のとき **local midnight として解釈** し UTC 換算後に比較。旧 v0.2.3 では UTC 文字列辞書順比較で 「JST 早朝に測った session を `since='今日'` で 検索すると 0 件」 の 静かな穴があった (session_id は JST 表示 / started_at は UTC で日付が 1 日ずれる)。完全 ISO (T + offset) は従来通り厳密。`BENCHTOP_TZ` env で tz override 可能。副 fix として各 tool の返り値に `started_at_local` を併記。詳細は下記「v0.2 で足したもの」節。
@@ -47,6 +49,8 @@ v0.2.4 は `search_sessions(since='YYYY-MM-DD')` の 解釈を **UTC 文字列�
 | `compare_sessions` *(v0.2)* | 2 セッションの mean/stdev/drift 差分と Welch 型 z スコアを返す (v0.2.1: `z_threshold` 明示パラメータ) |
 | `search_sessions` *(v0.2)* | 日付範囲・note キーワード・port・channel でセッションを絞り込む |
 | `verify_audit_chain` *(v0.3.0)* | audit log の sha256 prev-hash chain 整合性を検証 (改竄検出) |
+| `find_similar_sessions` *(v0.4.0)* | subject / mystery_id / environment key/value + tolerance で 過去 session を 絞り込み (「3ヶ月前の 同じ条件と 比べて」 用) |
+| `regression_check` *(v0.4.0)* | baseline vs current の mean_delta / stdev_ratio を tolerance-based で 判定 (校正基準からの 劣化検出) |
 
 存在しない `session_id` を渡した場合、`plot_session` / `analyze_session` / `compare_sessions` / `export_session_csv` は例外を投げずに `{"error": "session_not_found", "session_id": "...", "hint": "..."}` を返す (v0.2.1)。AI から見て tool 呼び出しが例外で落ちるより、error 情報を含む dict が返る方がリトライ or 別 tool に自然に繋がる。
 

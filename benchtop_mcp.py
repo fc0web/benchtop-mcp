@@ -279,6 +279,23 @@ class Session:
     # Session(**old_dict) は成功する (backward compatible)。
     aborted_at: str | None = None
     abort_reason: str | None = None
+    # v0.4.0: 実験ノート (experiment notebook) fields。 全 optional、 旧 JSON も
+    # 読める (default None、 空 dict は明示 empty)。 「3ヶ月前の 同じ条件と 比べて」
+    # を可能にするため 条件・被測定物・環境・装置設定を session に永続化。
+    # rei-aios の mystery / theory に ID linking も 保存。
+    subject: str | None = None
+    """被測定物の 識別子 (例: 'Arduino Uno #17', '抵抗器 R47', 'ProductX serial 001')。
+    同じ subject の 過去 session と 比較すると 個体の 経年劣化 追跡可能。"""
+    environment: dict[str, Any] | None = None
+    """環境条件 dict (自由 schema)。 例: {'temp_c': 25.3, 'humidity': 48.1, 'altitude_m': 15}。
+    後で 同条件 session を find_similar_sessions で 検索可能。"""
+    instrument_config: dict[str, Any] | None = None
+    """装置設定 dict (自由 schema)。 例: {'baudrate': 9600, 'sampling_hz': 10,
+    'calibration_ref': 'NIST-cert-2026-08-01'}。 校正記録 chain の 一部。"""
+    mystery_id: str | None = None
+    """rei-aios の mystery / theory への link ID。 rei-aios MCP の register_mystery で
+    生成される ID を 保存すると、 計測結果が 理論に自動で 積み上がる (chat-Claude
+    2026-08-17 「証拠が理論に自動で積み上がる」 提案 の 実現)。"""
 
     def path(self) -> Path:
         return DATA_DIR / f"{self.id}.json"
@@ -291,10 +308,16 @@ class Session:
 
 
 def load_session(session_id: str) -> Session:
+    """Load session from disk. Ignores unknown JSON keys for forward compatibility
+    (v0.5+ で 新 field 追加された JSON も 旧 code で read できる)。"""
     p = DATA_DIR / f"{session_id}.json"
     if not p.exists():
         raise FileNotFoundError(f"セッションが見つかりません: {session_id}")
-    return Session(**json.loads(p.read_text(encoding="utf-8")))
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    # 未知 key を除外 (forward compat)、 __dataclass_fields__ にある key のみ残す
+    known_fields = set(Session.__dataclass_fields__.keys())
+    filtered = {k: v for k, v in raw.items() if k in known_fields}
+    return Session(**filtered)
 
 
 def _load_session_or_error(session_id: str) -> Session | dict[str, Any]:
@@ -366,13 +389,21 @@ class Bench:
         baudrate: int = 9600,
         command: str | None = None,
         note: str = "",
+        subject: str | None = None,
+        environment: dict[str, Any] | None = None,
+        instrument_config: dict[str, Any] | None = None,
+        mystery_id: str | None = None,
     ) -> Session:
         if samples < 1 or samples > 10000:
             raise ValueError("samples は 1〜10000 の範囲で指定してください")
 
         dev = self.open(port, baudrate)
         sid = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{random.randint(100, 999)}"
-        session = Session(id=sid, port=port, started_at=_now(), note=note)
+        session = Session(
+            id=sid, port=port, started_at=_now(), note=note,
+            subject=subject, environment=environment,
+            instrument_config=instrument_config, mystery_id=mystery_id,
+        )
 
         # v0.2.1: 途中失敗を捕捉して部分結果を保存する。
         # 100 サンプルの途中 60 で失敗した場合、その 60 行と abort_reason を保存し、
@@ -840,7 +871,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.3.0",
+    version="0.4.0",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -851,6 +882,10 @@ server = MCPServer(
         "v0.3.0 追加: audit log hash chain (append-only JSONL + sha256 prev-hash)。"
         "全 tool 呼び出しが 記録され、verify_audit_chain で 改竄検出可能。"
         "証跡が価値になる領域 (ISO/IEC 17025 / GMP / 監査対応) 用。"
+        "v0.4.0 追加: 実験ノート (experiment notebook) fields — measure() に subject / "
+        "environment / instrument_config / mystery_id 全 optional 追加、 過去 session を "
+        "find_similar_sessions で subject/条件別 絞り込み、 regression_check で baseline vs "
+        "current の tolerance-based 劣化検出。 rei-aios の mystery/theory と ID linking 可能。"
     ),
 )
 
@@ -885,6 +920,10 @@ def measure(
     baudrate: int = 9600,
     command: str | None = None,
     note: str = "",
+    subject: str | None = None,
+    environment: dict[str, Any] | None = None,
+    instrument_config: dict[str, Any] | None = None,
+    mystery_id: str | None = None,
 ) -> dict[str, Any]:
     """装置から連続して測定値を読み取り、1つのセッションとして保存する。
 
@@ -896,6 +935,9 @@ def measure(
     になる。`abort_reason` に失敗内容が入る。100 回中 60 で止まっても
     「60 行取れた」と「なぜ止まったか」が残るので、失敗解析に使える。
 
+    v0.4.0: 実験ノート fields (subject / environment / instrument_config / mystery_id) 追加。
+    全 optional、 「3ヶ月前の同じ条件と 比べて」 を find_similar_sessions で 可能に。
+
     Args:
         port: 装置のポート名。既定は 'mock'。
         samples: 読み取る回数（1〜10000）。
@@ -903,12 +945,25 @@ def measure(
         baudrate: 通信速度。
         command: 毎回送信するコマンド。省略時は装置が自発的に送る行を読む。
         note: このセッションに付けるメモ。後から探すときの手がかりになる。
+        subject: (v0.4) 被測定物の 識別子 (例: 'Arduino Uno #17', '抵抗器 R47')。
+                 同じ subject の 過去 session と 比較すると 個体の 経年劣化 追跡可能。
+        environment: (v0.4) 環境条件 dict (自由 schema)。 例:
+                     {'temp_c': 25.3, 'humidity': 48.1}
+        instrument_config: (v0.4) 装置設定 dict (自由 schema)。 例:
+                           {'baudrate': 9600, 'sampling_hz': 10, 'calibration_ref': 'NIST-2026-08-01'}
+        mystery_id: (v0.4) rei-aios の mystery / theory への link ID。
+                    設定すると 計測結果が 理論に自動で 積み上がる。
 
     Returns:
         保存されたセッションIDと、その場での簡易サマリー。partial が True
-        のとき部分結果 (abort_reason に理由)。
+        のとき部分結果 (abort_reason に理由)。 v0.4 以降 は subject/environment/
+        instrument_config/mystery_id が top-level に mirror される。
     """
-    s = BENCH.measure(port, samples, interval_ms, baudrate, command, note)
+    s = BENCH.measure(
+        port, samples, interval_ms, baudrate, command, note,
+        subject=subject, environment=environment,
+        instrument_config=instrument_config, mystery_id=mystery_id,
+    )
     result = {
         "session_id": s.id,
         "saved_to": str(s.path()),
@@ -918,8 +973,13 @@ def measure(
         "partial": s.aborted_at is not None,
         "abort_reason": s.abort_reason,
         "summary": Bench.analyze(s)["channels"],
+        # v0.4.0: 実験ノート fields mirror
+        "subject": s.subject,
+        "environment": s.environment,
+        "instrument_config": s.instrument_config,
+        "mystery_id": s.mystery_id,
     }
-    # v0.3.0: audit log
+    # v0.3.0: audit log (v0.4.0: subject/mystery_id を detail に 追加)
     _write_audit(
         action="measure",
         target=s.id,
@@ -928,8 +988,221 @@ def measure(
             "port": port, "samples_requested": samples, "n_rows": len(s.rows),
             "channels": s.channels, "note": note,
             "abort_reason": s.abort_reason if s.aborted_at else None,
+            "subject": subject, "mystery_id": mystery_id,
+            "has_environment": environment is not None,
+            "has_instrument_config": instrument_config is not None,
         },
     )
+    return result
+
+
+@server.tool()
+def find_similar_sessions(
+    subject: str | None = None,
+    mystery_id: str | None = None,
+    environment_key: str | None = None,
+    environment_value: Any = None,
+    tolerance: float | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """v0.4.0: 実験ノート fields で 過去 session を 絞り込む。
+
+    「3ヶ月前の 同じ subject の 同じ条件で 測った session」 を 検索する ための tool。
+    subject / mystery_id は 完全一致、 environment は 単一 key の 値比較 (tolerance
+    指定時は 数値近似)、 since/until は search_sessions と 同じ 日付 filter (v0.2.4
+    date-only 解釈 + BENCHTOP_TZ)。 全条件 AND、 いずれも 省略可 (全 session 返却)。
+
+    Args:
+        subject: (完全一致) 被測定物 ID。 None なら 条件なし。
+        mystery_id: (完全一致) rei-aios mystery ID。 None なら 条件なし。
+        environment_key: environment dict の key 名 (例: 'temp_c')。 environment_value と併用。
+        environment_value: 上記 key の 期待値。 tolerance 指定時は 数値 |v - value| < tolerance。
+        tolerance: environment_value との 許容誤差 (数値時のみ)。 None なら 完全一致比較。
+        since: 日付下限。 v0.2.4 date-only 解釈 (YYYY-MM-DD なら local midnight)。
+        until: 日付上限。 v0.2.4 date-only 解釈。
+        limit: 返す最大件数。 既定 30。
+
+    Returns:
+        {"data_dir": ..., "filters": ..., "sessions": [{"session_id": ..., "subject": ...,
+         "environment": ..., "mystery_id": ..., "started_at": ..., ...}]}
+    """
+    from datetime import datetime as _dt
+
+    since_utc, since_meta = _resolve_date_boundary(since, is_since=True)
+    until_utc, until_meta = _resolve_date_boundary(until, is_since=False)
+
+    matched: list[dict[str, Any]] = []
+    if not DATA_DIR.exists():
+        _write_audit(action="find_similar_sessions", target=f"subject={subject},mystery={mystery_id}",
+                     result="success", detail={"n_matched": 0, "reason": "data_dir_missing"})
+        return {
+            "data_dir": str(DATA_DIR),
+            "filters": {"subject": subject, "mystery_id": mystery_id,
+                        "environment_key": environment_key, "environment_value": environment_value,
+                        "tolerance": tolerance, "since": since, "until": until, "limit": limit,
+                        "since_resolved_utc": since_meta.get("resolved_utc"),
+                        "until_resolved_utc": until_meta.get("resolved_utc")},
+            "sessions": matched,
+        }
+
+    for p in sorted(DATA_DIR.glob("*.json"), reverse=True):
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        # subject / mystery_id 完全一致 filter
+        if subject is not None and raw.get("subject") != subject:
+            continue
+        if mystery_id is not None and raw.get("mystery_id") != mystery_id:
+            continue
+        # environment key/value filter
+        if environment_key is not None:
+            env = raw.get("environment") or {}
+            if environment_key not in env:
+                continue
+            actual = env[environment_key]
+            if tolerance is not None and isinstance(actual, (int, float)) and isinstance(environment_value, (int, float)):
+                if abs(actual - environment_value) > tolerance:
+                    continue
+            else:
+                if actual != environment_value:
+                    continue
+        # since/until filter (started_at 文字列比較、 UTC ISO)
+        started = raw.get("started_at", "")
+        if since_utc and started < since_utc:
+            continue
+        if until_utc and started > until_utc:
+            continue
+        matched.append({
+            "session_id": raw.get("id"),
+            "started_at": started,
+            "started_at_local": _to_local_iso(started),
+            "port": raw.get("port"),
+            "note": raw.get("note", ""),
+            "subject": raw.get("subject"),
+            "environment": raw.get("environment"),
+            "instrument_config": raw.get("instrument_config"),
+            "mystery_id": raw.get("mystery_id"),
+            "channels": raw.get("channels", []),
+            "n_rows": len(raw.get("rows", [])),
+            "partial": raw.get("aborted_at") is not None,
+        })
+        if len(matched) >= limit:
+            break
+
+    _write_audit(action="find_similar_sessions",
+                 target=f"subject={subject},mystery={mystery_id},env={environment_key}",
+                 result="success", detail={"n_matched": len(matched), "limit": limit})
+    return {
+        "data_dir": str(DATA_DIR),
+        "filters": {"subject": subject, "mystery_id": mystery_id,
+                    "environment_key": environment_key, "environment_value": environment_value,
+                    "tolerance": tolerance, "since": since, "until": until, "limit": limit,
+                    "since_resolved_utc": since_meta.get("resolved_utc"),
+                    "until_resolved_utc": until_meta.get("resolved_utc"),
+                    "tz_used": since_meta.get("tz_used") or until_meta.get("tz_used")},
+        "sessions": matched,
+    }
+
+
+@server.tool()
+def regression_check(
+    baseline_session_id: str,
+    current_session_id: str,
+    tolerance_mean: float = 0.1,
+    tolerance_stdev_ratio: float = 0.5,
+) -> dict[str, Any]:
+    """v0.4.0: baseline session と 現在 session を 比較して 「劣化・回帰」 を 検出する。
+
+    compare_sessions が 「有意差 (Welch t 統計)」 を 返すのに対して、 regression_check は
+    「実用的 tolerance を 超えた 変化」 を 返す。 校正基準 (baseline) から どれだけ ズレたら
+    「異常」 とみなすかを、 caller が tolerance で 明示指定する。
+
+    共通チャンネル 各々 について:
+      - mean_delta = |mean_current - mean_baseline| が tolerance_mean を 超えたら regression=True
+      - stdev_ratio = stdev_current / stdev_baseline が (1 - tolerance_stdev_ratio, 1 + tolerance_stdev_ratio)
+        の 外なら stdev_regression=True (ノイズ悪化 or 装置固定化)
+      - drift_delta = |drift_current - drift_baseline| も 参考値として返す
+
+    存在しない session_id は structured error dict を返す (例外は投げない)。
+
+    Args:
+        baseline_session_id: 基準 session ID (通常 = 出荷時校正 or 前月同条件)。
+        current_session_id: 現在 session ID (今 測定した もの)。
+        tolerance_mean: mean 差 の 許容値 (単位は チャンネルの 単位 と 同じ)。 既定 0.1。
+        tolerance_stdev_ratio: stdev 比 の 許容比率 (0.5 なら ±50%)。 既定 0.5。
+
+    Returns:
+        {"any_regression": bool, "channels": {ch: {"mean_baseline": ..., "mean_current": ...,
+         "mean_delta": ..., "mean_regression": bool, "stdev_baseline": ..., "stdev_current": ...,
+         "stdev_ratio": ..., "stdev_regression": bool, "drift_delta": ...}}, "tolerance": {...}}
+    """
+    a = _load_session_or_error(baseline_session_id)
+    if isinstance(a, dict):
+        _write_audit(action="regression_check",
+                     target=f"{baseline_session_id}|{current_session_id}",
+                     result="error", detail={"error": a.get("error"), "which": "baseline"})
+        return a
+    b = _load_session_or_error(current_session_id)
+    if isinstance(b, dict):
+        _write_audit(action="regression_check",
+                     target=f"{baseline_session_id}|{current_session_id}",
+                     result="error", detail={"error": b.get("error"), "which": "current"})
+        return b
+
+    analyze_a = Bench.analyze(a)
+    analyze_b = Bench.analyze(b)
+    ch_a = analyze_a.get("channels", {})
+    ch_b = analyze_b.get("channels", {})
+    shared = sorted(set(ch_a.keys()) & set(ch_b.keys()))
+
+    per_channel: dict[str, dict[str, Any]] = {}
+    any_regression = False
+    for ch in shared:
+        ma, mb = ch_a[ch]["mean"], ch_b[ch]["mean"]
+        sa, sb = ch_a[ch]["stdev"], ch_b[ch]["stdev"]
+        da, db = ch_a[ch]["drift"], ch_b[ch]["drift"]
+        mean_delta = abs(mb - ma)
+        mean_reg = mean_delta > tolerance_mean
+        if sa > 0:
+            stdev_ratio = sb / sa
+            stdev_reg = (stdev_ratio < (1 - tolerance_stdev_ratio)
+                         or stdev_ratio > (1 + tolerance_stdev_ratio))
+        else:
+            stdev_ratio = None
+            stdev_reg = None  # baseline stdev=0 → 判定不能 (定数装置)
+        drift_delta = abs(db - da)
+        if mean_reg or (stdev_reg is True):
+            any_regression = True
+        per_channel[ch] = {
+            "mean_baseline": ma, "mean_current": mb, "mean_delta": mean_delta,
+            "mean_regression": mean_reg,
+            "stdev_baseline": sa, "stdev_current": sb, "stdev_ratio": stdev_ratio,
+            "stdev_regression": stdev_reg,
+            "drift_baseline": da, "drift_current": db, "drift_delta": drift_delta,
+        }
+
+    result = {
+        "any_regression": any_regression,
+        "shared_channels": shared,
+        "channels": per_channel,
+        "tolerance": {"tolerance_mean": tolerance_mean,
+                      "tolerance_stdev_ratio": tolerance_stdev_ratio},
+        "baseline": {"session_id": baseline_session_id, "subject": a.subject,
+                     "started_at": a.started_at, "started_at_local": _to_local_iso(a.started_at),
+                     "n_rows": len(a.rows)},
+        "current": {"session_id": current_session_id, "subject": b.subject,
+                    "started_at": b.started_at, "started_at_local": _to_local_iso(b.started_at),
+                    "n_rows": len(b.rows)},
+    }
+    _write_audit(action="regression_check",
+                 target=f"{baseline_session_id}|{current_session_id}",
+                 result="success",
+                 detail={"any_regression": any_regression, "n_shared_channels": len(shared),
+                         "tolerance_mean": tolerance_mean,
+                         "tolerance_stdev_ratio": tolerance_stdev_ratio})
     return result
 
 
@@ -1463,6 +1736,93 @@ def _selftest() -> int:
             os.environ.pop("BENCHTOP_TZ", None)
         else:
             os.environ["BENCHTOP_TZ"] = old_tz
+
+    # [17] v0.4.0 実験ノート: subject / environment / instrument_config / mystery_id 拡張 +
+    # find_similar_sessions で cross-session lookup verify (Session backward compat 含む)
+    exp_env = {"temp_c": 25.3, "humidity": 48.1}
+    exp_cfg = {"baudrate": 9600, "sampling_hz": 10, "calibration_ref": "NIST-selftest"}
+    s17a = BENCH.measure(port="mock", samples=5, interval_ms=0,
+                          note="selftest-v04-exp-notebook-a",
+                          subject="test-device-A", environment=exp_env,
+                          instrument_config=exp_cfg, mystery_id="mystery-42")
+    s17b = BENCH.measure(port="mock", samples=5, interval_ms=0,
+                          note="selftest-v04-exp-notebook-b",
+                          subject="test-device-A", environment=exp_env,
+                          instrument_config=exp_cfg, mystery_id="mystery-42")
+    # Round-trip: 保存 → load → 拡張 fields 保持確認
+    ld_a = load_session(s17a.id)
+    assert ld_a.subject == "test-device-A", f"subject not persisted: {ld_a.subject}"
+    assert ld_a.environment == exp_env, f"environment not persisted: {ld_a.environment}"
+    assert ld_a.instrument_config == exp_cfg, f"instrument_config not persisted"
+    assert ld_a.mystery_id == "mystery-42", f"mystery_id not persisted: {ld_a.mystery_id}"
+
+    # subject 完全一致 filter
+    r17_subj = find_similar_sessions(subject="test-device-A", limit=10)
+    n_subj = len(r17_subj["sessions"])
+    assert n_subj >= 2, f"subject filter で 2 件以上 期待 だが {n_subj}"
+    ids_subj = {row["session_id"] for row in r17_subj["sessions"]}
+    assert s17a.id in ids_subj and s17b.id in ids_subj
+
+    # mystery_id 完全一致
+    r17_mys = find_similar_sessions(mystery_id="mystery-42", limit=10)
+    n_mys = len(r17_mys["sessions"])
+    assert n_mys >= 2, f"mystery_id filter で 2 件以上 期待 だが {n_mys}"
+
+    # environment_key tolerance 数値近似
+    r17_env = find_similar_sessions(environment_key="temp_c", environment_value=25.0,
+                                     tolerance=1.0, limit=10)
+    n_env = len(r17_env["sessions"])
+    assert n_env >= 2, f"environment tolerance filter で 2 件以上 期待 だが {n_env}"
+
+    # backward compat: 旧 JSON (v0.3.0 以前、 新 field なし) も load できる
+    old_style_id = "20260817-000000-000"
+    old_style_path = DATA_DIR / f"{old_style_id}.json"
+    old_style_dict = {
+        "id": old_style_id, "port": "mock",
+        "started_at": "2026-08-17T00:00:00+00:00", "note": "selftest-v04-old-style",
+        "channels": ["T"], "rows": [{"t": 0.0, "T": 25.0}], "skipped": 0,
+        # 新 field なし = 旧 v0.3.0 相当
+    }
+    old_style_path.write_text(json.dumps(old_style_dict), encoding="utf-8")
+    ld_old = load_session(old_style_id)
+    assert ld_old.subject is None, "旧 JSON で subject default None 期待"
+    assert ld_old.environment is None
+    assert ld_old.mystery_id is None
+    print(f"[17] v0.4 実験ノート: subject/env/mystery persisted (n_subj={n_subj} n_mys={n_mys} "
+          f"n_env_tol={n_env}) + backward compat (old JSON load OK)")
+
+    # [18] v0.4.0 regression_check: baseline vs current の tolerance-based gap detection
+    # baseline (小 variance mock) vs current (同 mock 別 seed = 微小差、 tolerance 内)
+    s18_base = BENCH.measure(port="mock", samples=30, interval_ms=0,
+                              note="selftest-v04-regression-baseline",
+                              subject="calibration-A", instrument_config={"cal_ref": "2026-08-17"})
+    s18_curr = BENCH.measure(port="mock", samples=30, interval_ms=0,
+                              note="selftest-v04-regression-current",
+                              subject="calibration-A")
+    r18a = regression_check(baseline_session_id=s18_base.id,
+                             current_session_id=s18_curr.id,
+                             tolerance_mean=5.0, tolerance_stdev_ratio=1.0)
+    # 緩い tolerance (5.0) なら 通常 mock は regression=False 期待 (mock は 25 前後 σ<1)
+    print(f"[18a] regression_check (緩い tol=5.0): any_regression={r18a['any_regression']} "
+          f"shared_channels={r18a['shared_channels']}")
+    assert "shared_channels" in r18a
+    assert len(r18a["shared_channels"]) > 0
+
+    # 厳しい tolerance (0.001) なら regression=True 期待 (mock noise > 0.001)
+    r18b = regression_check(baseline_session_id=s18_base.id,
+                             current_session_id=s18_curr.id,
+                             tolerance_mean=0.001, tolerance_stdev_ratio=0.001)
+    print(f"[18b] regression_check (厳しい tol=0.001): any_regression={r18b['any_regression']} "
+          f"expected=True (mock noise)")
+    # 厳しい tol で どこかの channel が 引っかかる 期待 (mock は 3 ch 全て noise あり)
+    assert r18b["any_regression"] is True, "厳しい tol で 少なくとも 1 ch regression 期待"
+
+    # error path: 存在しない session_id → structured error
+    r18c = regression_check(baseline_session_id="nonexistent-xyz",
+                             current_session_id=s18_curr.id)
+    print(f"[18c] regression_check invalid baseline → error={r18c.get('error')}")
+    assert r18c.get("error") == "session_not_found"
+    assert r18c.get("session_id") == "nonexistent-xyz"
 
     # [16] audit log hash chain verify (v0.3.0 主 fix、 Rei-Automator STEP 1340 primitive port)
     # session store と 別 store で 全 tool 呼び出しの 説明責任 記録、 改竄検出可能。
