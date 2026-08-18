@@ -296,6 +296,11 @@ class Session:
     """rei-aios の mystery / theory への link ID。 rei-aios MCP の register_mystery で
     生成される ID を 保存すると、 計測結果が 理論に自動で 積み上がる (chat-Claude
     2026-08-17 「証拠が理論に自動で積み上がる」 提案 の 実現)。"""
+    # v0.5.0-alpha (SPIKE): 測定記録の origin identifier。 'benchtop' は 従来 measure() 由来
+    # (default 維持で 全 backward compat)、 'external:rigol-mcp' 等 は import_external_session
+    # 経由 の 他 MCP server 由来。 chat-Claude 2026-08-18 report §3-1 「機器層/記録層 分割」
+    # + 4 agent verify 2026-08-19 の 実装。 藤本さん judgment 待ち で 本 field は spike only。
+    source: str = "benchtop"
 
     def path(self) -> Path:
         return DATA_DIR / f"{self.id}.json"
@@ -836,6 +841,11 @@ BENCH = Bench()
 # ---------------------------------------------------------------------------
 
 from benchtop_audit_log import AuditLogWriter  # noqa: E402
+from benchtop_provenance import (  # noqa: E402 -- v0.5.0-alpha SPIKE
+    SafetyGate,
+    import_external_session as _provenance_import,
+    build_session_dict_from_import,
+)
 
 AUDIT_DIR = Path(os.environ.get("BENCHTOP_AUDIT_DIR", str(DATA_DIR / "audit")))
 _AUDIT_ENABLED = os.environ.get("BENCHTOP_AUDIT", "1").strip() not in ("0", "false", "no", "")
@@ -1204,6 +1214,92 @@ def regression_check(
                          "tolerance_mean": tolerance_mean,
                          "tolerance_stdev_ratio": tolerance_stdev_ratio})
     return result
+
+
+@server.tool()
+def import_external_session(
+    source: str,
+    records: list[dict[str, Any]],
+    subject: str | None = None,
+    mystery_id: str | None = None,
+    environment: dict[str, Any] | None = None,
+    instrument_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """他の MCP server (Keysight MCP / rigol-mcp / lecroy-mcp / kya-os wrapped) が
+    計測した記録を benchtop に取り込み、 全 tool 呼び出しと同じ audit chain で 記録する。
+
+    v0.5.0-alpha SPIKE (2026-08-19、 藤本さん judgment 待ち)。 chat-Claude 2026-08-18
+    「MCP コネクタ世界一」 report §3-1 「機器層 (SCPI) は捨て、 記録層に座る」 の 実装。
+
+    SafetyGate を 全 record に 適用 (default: Kikusui PLZ-5W CR mode Siemens/Ω 混同
+    dangerous rule built-in)、 hazard 検出 record は import 時点で reject、
+    accepted record のみ Session として persist。 全 import は audit log に 記録。
+
+    Args:
+        source: origin identifier。 例: 'external:rigol-mcp', 'external:keysight-mcp',
+                'external:kya-os:<inner-source>'
+        records: list of measurement records。 各 dict の required key: 'ts', 'channels',
+                 'values'。 optional: 'unit_hints', 'instrument' (SafetyGate lookup 用),
+                 'raw', 'attestation' (kya-os JOSE proof 等、 pass-through 保存のみ)。
+        subject: 被測定物 ID (Session.subject 継承)
+        mystery_id: rei-aios mystery / theory link ID (Session.mystery_id 継承)
+        environment: 環境条件 dict (Session.environment 継承)
+        instrument_config: 装置設定 dict (Session.instrument_config 継承)
+
+    Returns:
+        成功時: {"ok": True, "session_id": "ext-...", "records_accepted": N,
+                 "records_rejected": M, "rejections": [...]}
+        全 reject: {"ok": False, "session_id": None, ...}
+        SafetyGate violation の 各 rejection は {"index", "rule_id", "severity",
+        "reason", "suggested_fix", "detail"} を含む。
+    """
+    result = _provenance_import(
+        source=source,
+        records=records,
+        subject=subject,
+        mystery_id=mystery_id,
+        environment=environment,
+        instrument_config=instrument_config,
+        safety_gate=SafetyGate(),
+    )
+
+    if result.ok and result.session_id is not None:
+        # persist as Session (backward-compat via source field default)
+        session_dict = build_session_dict_from_import(
+            result=result,
+            source=source,
+            records=records,
+            subject=subject,
+            mystery_id=mystery_id,
+            environment=environment,
+            instrument_config=instrument_config,
+        )
+        if session_dict is not None:
+            known_fields = set(Session.__dataclass_fields__.keys())
+            filtered = {k: v for k, v in session_dict.items() if k in known_fields}
+            sess = Session(**filtered)
+            sess.save()
+
+    _write_audit(
+        action="import_external_session",
+        target=f"{source}|{result.session_id or 'REJECTED'}",
+        result="success" if result.ok else "rejected",
+        detail={
+            "source": source,
+            "records_accepted": result.records_accepted,
+            "records_rejected": result.records_rejected,
+            "rejection_rule_ids": sorted({r.get("rule_id", "?") for r in result.rejections}),
+        },
+    )
+
+    return {
+        "ok": result.ok,
+        "session_id": result.session_id,
+        "records_accepted": result.records_accepted,
+        "records_rejected": result.records_rejected,
+        "rejections": result.rejections,
+        "warning": result.warning,
+    }
 
 
 @server.tool()
@@ -1876,7 +1972,132 @@ def _selftest() -> int:
         assert chk4["valid"] is False
         assert chk4.get("broken_at") == 1
 
+    # [19] v0.5.0-alpha SPIKE : import_external_session + SafetyGate + provenance layer
+    # chat-Claude 2026-08-18 「MCP コネクタ世界一」 report §3-1 「機器層/記録層 分割」 の
+    # 4 agent verify 済 実装。 3 case で 動作確認: valid import / Kikusui hazard reject /
+    # audit chain 統合性維持。
+    print("\n--- [19] v0.5.0-alpha SPIKE: import_external_session + SafetyGate ---")
+
+    # [19a] valid external import: rigol-mcp mock 由来 record → accept + Session persist
+    now_iso = _now()
+    r19a = import_external_session(
+        source="external:rigol-mcp-mock",
+        records=[
+            {"ts": now_iso, "channels": ["V", "I"], "values": {"V": 3.30, "I": 0.15}},
+            {"ts": now_iso, "channels": ["V", "I"], "values": {"V": 3.31, "I": 0.14}},
+            {"ts": now_iso, "channels": ["V", "I"], "values": {"V": 3.30, "I": 0.16}},
+        ],
+        subject="test-DUT-042",
+        mystery_id="mys-spike-19a",
+    )
+    print(f"[19a] import valid rigol-mock (3 records): ok={r19a['ok']} "
+          f"session_id={r19a['session_id']} accepted={r19a['records_accepted']} "
+          f"rejected={r19a['records_rejected']}")
+    assert r19a["ok"] is True
+    assert r19a["records_accepted"] == 3
+    assert r19a["records_rejected"] == 0
+    assert r19a["session_id"] is not None
+    assert r19a["session_id"].startswith("ext-external-rigol-mcp-mock-")
+    # verify Session persisted with source field
+    sess_a = load_session(r19a["session_id"])
+    assert sess_a.source == "external:rigol-mcp-mock", f"source mismatch: {sess_a.source}"
+    assert sess_a.subject == "test-DUT-042"
+    assert sess_a.mystery_id == "mys-spike-19a"
+
+    # [19b] Kikusui PLZ-5W CR mode Siemens hazard → reject
+    # 「100 Ω」 のつもりで 100 (S) を送る → 0.01 Ω 短絡 hazard
+    r19b = import_external_session(
+        source="external:kikusui-mcp-mock",
+        records=[
+            # safe: legitimate 0.1 S = 10 Ω
+            {"ts": now_iso, "channels": ["V"], "values": {"V": 3.3},
+             "instrument": {"vendor": "KIKUSUI", "model": "PLZ1205W"},
+             "raw": {"command": "CONDuctance 0.1"}},
+            # HAZARD: 100 S = 0.01 Ω, silent short-circuit
+            {"ts": now_iso, "channels": ["V"], "values": {"V": 3.3},
+             "instrument": {"vendor": "KIKUSUI", "model": "PLZ1205W"},
+             "raw": {"command": "CONDuctance 100"}},
+            # safe: 0.5 S = 2 Ω
+            {"ts": now_iso, "channels": ["V"], "values": {"V": 3.3},
+             "instrument": {"vendor": "KIKUSUI", "model": "PLZ1205W"},
+             "raw": {"command": "SOURce:CONDuctance:LEVel:IMMediate 0.5"}},
+        ],
+        subject="test-Kikusui-PLZ5W-safety",
+    )
+    print(f"[19b] Kikusui PLZ-5W CR hazard: ok={r19b['ok']} "
+          f"accepted={r19b['records_accepted']} rejected={r19b['records_rejected']} "
+          f"rejection_rule={r19b['rejections'][0]['rule_id'] if r19b['rejections'] else None}")
+    assert r19b["ok"] is True  # partial: 2 accepted + 1 rejected
+    assert r19b["records_accepted"] == 2
+    assert r19b["records_rejected"] == 1
+    assert r19b["rejections"][0]["rule_id"] == "kikusui-plz5w-cr-conductance-hazard"
+    assert r19b["rejections"][0]["severity"] == "dangerous"
+    assert r19b["rejections"][0]["detail"]["equivalent_ohms"] == 0.01
+
+    # [19c] all records reject: ok=False + session_id=None
+    r19c = import_external_session(
+        source="external:kikusui-mcp-mock",
+        records=[
+            {"ts": now_iso, "channels": ["V"], "values": {"V": 3.3},
+             "instrument": {"vendor": "KIKUSUI", "model": "PLZ405W"},
+             "raw": {"command": "CONDuctance 50"}},  # 0.02 Ω hazard
+            {"ts": now_iso, "channels": ["V"], "values": {"V": 3.3},
+             "instrument": {"vendor": "KIKUSUI", "model": "PLZ405W"},
+             "raw": {"command": "CONDuctance 200"}},  # 0.005 Ω hazard
+        ],
+    )
+    print(f"[19c] all-reject batch: ok={r19c['ok']} session_id={r19c['session_id']} "
+          f"rejected={r19c['records_rejected']} warning={r19c['warning']}")
+    assert r19c["ok"] is False
+    assert r19c["session_id"] is None
+    assert r19c["records_accepted"] == 0
+    assert r19c["records_rejected"] == 2
+
+    # [19d] audit chain integrity after 3 imports: 全 import が audit log に 記録され chain 保持
+    chk19 = verify_audit_chain()
+    print(f"[19d] audit chain after 3 imports: valid={chk19['valid']} total={chk19['total']} "
+          f"(includes 3 import_external_session entries)")
+    assert chk19["valid"] is True
+    assert chk19["total"] >= 3, f"想定 total ≥ 3 (import 3 件) だが {chk19['total']}"
+
+    # [19e] non-Kikusui vendor bypass: SafetyGate rule は Kikusui 特化、 他 vendor は info verdict
+    r19e = import_external_session(
+        source="external:siglent-mcp-mock",
+        records=[
+            {"ts": now_iso, "channels": ["V"], "values": {"V": 3.3},
+             "instrument": {"vendor": "SIGLENT", "model": "SDL1000X"},
+             "raw": {"command": ":SOURce:RESistance:LEVel:IMMediate 100"}},  # Siglent は Ω 単位 = OK
+        ],
+    )
+    print(f"[19e] non-Kikusui vendor (Siglent SDL1000X): ok={r19e['ok']} "
+          f"accepted={r19e['records_accepted']} rejected={r19e['records_rejected']}")
+    assert r19e["ok"] is True
+    assert r19e["records_accepted"] == 1
+    assert r19e["records_rejected"] == 0
+
+    # [19f] backward compat: 旧 v0.4.0 以前の Session JSON (source field なし) を load
+    # source field は default 'benchtop' で 補完される (load_session の filter が protect)
+    old_style_id = "20260101-000000-legacy-test"
+    old_path = DATA_DIR / f"{old_style_id}.json"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    old_path.write_text(json.dumps({
+        "id": old_style_id, "port": "COM3", "started_at": "2026-01-01T00:00:00+00:00",
+        "note": "legacy pre-v0.5.0", "channels": ["V"], "rows": [{"ts": now_iso, "V": 3.3}],
+        "skipped": 0,
+        # NO source field intentionally
+    }), encoding="utf-8")
+    try:
+        sess_old = load_session(old_style_id)
+        print(f"[19f] backward compat: legacy JSON (no source field) loaded → "
+              f"source='{sess_old.source}' (default 'benchtop' 適用)")
+        assert sess_old.source == "benchtop", f"backward compat 破れ: source={sess_old.source}"
+    finally:
+        # cleanup legacy fixture
+        if old_path.exists():
+            old_path.unlink()
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
+    print("v0.5.0-alpha SPIKE: import_external_session + SafetyGate + source field 追加 動作確認。")
     return 0
 
 
