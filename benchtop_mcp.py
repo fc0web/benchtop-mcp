@@ -846,6 +846,16 @@ from benchtop_provenance import (  # noqa: E402 -- v0.5.0-alpha SPIKE
     import_external_session as _provenance_import,
     build_session_dict_from_import,
 )
+# v0.6.0-alpha (2026-08-20): physics-limits pre-flight layer
+# chat-Claude 2026-08-20 「LLM が 単位付き算術で 自信満々に間違える」 対策の 5 tool。
+# SafetyGate と 相補 (SafetyGate = SCPI-arg level、 physics-limits = 事前規模計算)。
+from benchtop_physics_limits import (  # noqa: E402
+    bekenstein_bound_bits as _pl_bekenstein,
+    landauer_min_energy_j as _pl_landauer,
+    lloyd_computation_ceiling as _pl_lloyd,
+    operator_space_size as _pl_operator_space,
+    compression_upper_bound as _pl_compression,
+)
 
 AUDIT_DIR = Path(os.environ.get("BENCHTOP_AUDIT_DIR", str(DATA_DIR / "audit")))
 _AUDIT_ENABLED = os.environ.get("BENCHTOP_AUDIT", "1").strip() not in ("0", "false", "no", "")
@@ -881,7 +891,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.4.0",
+    version="0.6.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -896,6 +906,14 @@ server = MCPServer(
         "environment / instrument_config / mystery_id 全 optional 追加、 過去 session を "
         "find_similar_sessions で subject/条件別 絞り込み、 regression_check で baseline vs "
         "current の tolerance-based 劣化検出。 rei-aios の mystery/theory と ID linking 可能。"
+        "v0.5.0-alpha 追加 (SPIKE): import_external_session で他社 MCP server (Keysight/rigol/"
+        "lecroy/kya-os wrapped) の 計測記録を benchtop に取り込み + SafetyGate で SCPI-argument "
+        "level の hazard (Kikusui PLZ-5W CR mode Siemens 混同 = 短絡 hazard 等) を静的検出。"
+        "v0.6.0-alpha 追加: physics-limits pre-flight 5 tool — bekenstein_bound_bits / "
+        "landauer_min_energy_j / lloyd_computation_ceiling / operator_space_size / "
+        "compression_upper_bound。 実 hardware 送出前の 単位付き算術 + 桁勘定 + 上界計算を "
+        "LLM 単体で 誤りやすい 領域として MCP 化。 Kolmogorov K(x) uncomputable は siren-family "
+        "pattern 回避で明示 disclaimer 付き。 全 pure calc (stdlib のみ、 状態なし)。"
     ),
 )
 
@@ -1300,6 +1318,127 @@ def import_external_session(
         "rejections": result.rejections,
         "warning": result.warning,
     }
+
+
+# ---------------------------------------------------------------------------
+# v0.6.0-alpha (2026-08-20): physics-limits pre-flight layer (5 tools)
+# ---------------------------------------------------------------------------
+#   chat-Claude 2026-08-20 turn: 「LLM が 単位付き算術で 自信満々に間違える」 領域 =
+#   Bekenstein / Landauer / Lloyd / operator space / compression bound の 5 primitive。
+#   実 hardware SCPI 送出 (measure() 等) の pre-flight check として 使える。
+#   SafetyGate (v0.5.0-alpha、 SCPI-argument level) と 相補: 事前規模計算 → SafetyGate。
+#
+#   ★ 命名 discipline: 「上界 / 最小 / 上限 / 空間 size」 の semantic を name に埋め込み、
+#      Kolmogorov K(x) uncomputable の 果たせない約束を 名乗らない ([[feedback-super-
+#      naming-siren-family-pattern]] 遵守)。 return dict にも is_upper_bound / is_lower_bound
+#      flag を含める。
+#
+#   ★ 全 tool は pure calculation (stdlib のみ)、 状態なし、 network I/O なし。
+#      remote MCP としても そのまま deploy 可能 (依存 lag なし)。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def bekenstein_bound_bits(radius_m: float, energy_J: float) -> dict[str, Any]:
+    """球状領域 (半径 R メートル、 総エネルギー E ジュール) に含みうる 情報量の上界を bits で返す。
+
+    Formula: S ≤ 2π R E / (ℏ c ln 2)  bits (Bekenstein 1981, PRD 23:287)。
+    上界のみ (is_upper_bound: True)、 球状 (非回転) 領域 + 弱重力 regime 前提。
+
+    Args:
+        radius_m: 系を含む 最小球の 半径 (メートル)、 must be > 0。
+        energy_J: 系の 全質量-エネルギー (ジュール)、 must be > 0。
+
+    Returns dict with: bound_bits, bound_nats, is_upper_bound, assumptions,
+    citation, honest_scope。 詳細は benchtop_physics_limits モジュール docstring。
+    """
+    return _pl_bekenstein(radius_m, energy_J)
+
+
+@server.tool()
+def landauer_min_energy_j(bits: float, temperature_K: float = 300.0) -> dict[str, Any]:
+    """N bit を 不可逆的に 消去する 最小エネルギー (Joules)、 環境温度 T Kelvin で。
+
+    Formula: E_min = N × k_B × T × ln 2  J  (Landauer 1961, IBM J. Res. Dev. 5:183)。
+    下限のみ (is_lower_bound: True)、 irreversible (bit erase) 操作専用。
+    Reversible computation (Bennett 1973) は E=0 下限 の 別 regime = scope 外。
+
+    T=300 K, N=1 で ≈ 2.87 × 10⁻²¹ J ≈ 0.018 eV (実 CMOS は 10⁹〜10¹² × 上で動作)。
+
+    Args:
+        bits: 消去 bit 数 (float 可、 partial-erasure amortization 用)。 must be >= 0。
+        temperature_K: 環境温度 Kelvin、 default 300 (室温)。
+
+    Returns dict with: min_energy_J, min_energy_eV, min_energy_kT_ln2 (dimensionless),
+    is_lower_bound, assumptions, citation, honest_scope。
+    """
+    return _pl_landauer(bits, temperature_K)
+
+
+@server.tool()
+def lloyd_computation_ceiling(mass_kg: float) -> dict[str, Any]:
+    """質量 m kg の 系が 単位時間あたりに 実行可能な 演算数の 究極的上限 (ops/s)。
+
+    Formula: rate ≤ 2 m c² / (π ℏ)  ops/s  (Lloyd 2000, Nature 406:1047)。
+    「operation」 = orthogonal Hilbert-space state transition (Margolus-Levitin 1998)、
+    実 FLOPS とは 直接比較 不能。 究極的 thought experiment、 実 device は 10⁴⁰+ × 下。
+
+    m=1 kg で ≈ 5.43 × 10⁵⁰ ops/s (Lloyd's ultimate laptop)。
+
+    Args:
+        mass_kg: 系の 静止質量 (kg)、 must be > 0。
+
+    Returns dict with: ops_per_second_ceiling, energy_J, min_op_time_s,
+    is_upper_bound, assumptions, citation, honest_scope。
+    """
+    return _pl_lloyd(mass_kg)
+
+
+@server.tool()
+def operator_space_size(k: int, n: int) -> dict[str, Any]:
+    """k 値 n 変数 演算子の 総数 = k^(k^n)、 及び LUT / config bits / 列挙時間。
+
+    Formula: input_configurations = k^n / total_functions = k^(k^n)。
+    D-FUMT₈ (k=8) では: n=1→8^8=16.78M / n=2→8^64≈6.28×10⁵⁷ / n=3→8^512≈10⁴⁶² (物理的到達不能)。
+
+    ★ 理論上限 (is_theoretical_max: True)、 実 FPGA 合成では BDD + shared subexpression
+    で 実効 config bits は 大幅減 (STEP 1011 D-FUMT₈ ALU が Tang Nano 9K で 37 LUT4 実測)。
+
+    Args:
+        k: 論理値の数 (2=Boolean, 4=Belnap-FDE, 8=D-FUMT₈)。 must be int >= 2。
+        n: 変数の数。 must be int >= 0。
+
+    Returns dict with: input_configurations, total_functions_log10, total_functions_str,
+    config_bits, lut_k_entries, enumeration_seconds_1ns, is_theoretical_max, ...
+    """
+    return _pl_operator_space(k, n)
+
+
+@server.tool()
+def compression_upper_bound(
+    length: int,
+    entropy_bits_per_symbol: float = 1.0,
+    method: str = "shannon",
+) -> dict[str, Any]:
+    """長さ N の source (per-symbol entropy H) の 圧縮後長の 上界 (bits)。
+
+    Formula: L ≥ N × H (Shannon 1948 下限) / L ≈ N × H + O(log N) (実用上界)。
+
+    ★★★ CRITICAL disclaimer (siren-family pattern 回避):
+      **Kolmogorov complexity K(x) は Turing-uncomputable** (Chaitin 1975)。
+      本 tool は Shannon entropy (statistical) 上界のみ、 K(x) の 実現値ではない。
+      K(x) ≤ N·H + O(log N) は 常に 成立 (K は universal に tighter)、 但し K を
+      直接返す tool は 原理的に 作成不可 = 本 tool は 「上界の一つ」 の位置付け。
+
+    Args:
+        length: source symbol 数 N。 must be int >= 0。
+        entropy_bits_per_symbol: H (Shannon entropy per symbol)。 default 1.0 (binary uniform)。
+        method: "shannon" (default) / "typical_set" (AEP) / "arithmetic" (arithmetic coding)。
+
+    Returns dict with: shannon_lower_bound_bits, practical_upper_bound_bits,
+    compression_ratio_min, is_upper_bound, kolmogorov_note, assumptions, ...
+    """
+    return _pl_compression(length, entropy_bits_per_symbol, method)
 
 
 @server.tool()
@@ -2096,8 +2235,69 @@ def _selftest() -> int:
         if old_path.exists():
             old_path.unlink()
 
+    # ------------------------------------------------------------------
+    # [20] v0.6.0-alpha: physics-limits pre-flight layer (5 tool MCP wrappers)
+    # ------------------------------------------------------------------
+    #   MCP tool 層の 呼び出しで module 実装との 一致 verify (module 側 selftest 28/28
+    #   PASS 済、 ここは wire integrity と 数値 sanity 再確認のみ)。
+    print("\n--- [20] v0.6.0-alpha: physics-limits pre-flight (5 MCP tool wire) ---")
+
+    # [20a] bekenstein: 1 m, 1 J → ~2.87e26 bits
+    r20a = bekenstein_bound_bits(radius_m=1.0, energy_J=1.0)
+    print(f"[20a] bekenstein(1m, 1J): bound_bits={r20a['bound_bits']:.3e} "
+          f"is_upper_bound={r20a['is_upper_bound']}")
+    assert r20a["ok"] is True
+    assert 2.8e26 < r20a["bound_bits"] < 2.95e26
+    assert r20a["is_upper_bound"] is True
+
+    # [20b] landauer: 1 bit at 300 K → ~2.87e-21 J
+    r20b = landauer_min_energy_j(bits=1, temperature_K=300.0)
+    print(f"[20b] landauer(1 bit, 300 K): min_energy_J={r20b['min_energy_J']:.3e} "
+          f"eV={r20b['min_energy_eV']:.4f} is_lower_bound={r20b['is_lower_bound']}")
+    assert r20b["ok"] is True
+    assert 2.8e-21 < r20b["min_energy_J"] < 2.95e-21
+    assert r20b["is_lower_bound"] is True
+
+    # [20c] lloyd: 1 kg → ~5.43e50 ops/s
+    r20c = lloyd_computation_ceiling(mass_kg=1.0)
+    print(f"[20c] lloyd(1 kg): ops_ceiling={r20c['ops_per_second_ceiling']:.3e} "
+          f"energy_J={r20c['energy_J']:.3e}")
+    assert r20c["ok"] is True
+    assert 5.3e50 < r20c["ops_per_second_ceiling"] < 5.5e50
+
+    # [20d] operator_space: k=8, n=2 → log10 ~57.8 (D-FUMT₈ 2-var truth table)
+    r20d = operator_space_size(k=8, n=2)
+    print(f"[20d] operator_space(k=8, n=2): input_configs={r20d['input_configurations']} "
+          f"total_log10={r20d['total_functions_log10']:.4f} "
+          f"config_bits={r20d['config_bits']} lut_entries={r20d['lut_k_entries']}")
+    assert r20d["ok"] is True
+    assert r20d["input_configurations"] == 64
+    assert 57.7 < r20d["total_functions_log10"] < 57.9
+    assert r20d["is_theoretical_max"] is True
+
+    # [20e] compression: N=1000, H=1.0 (uniform binary) → lower=1000, upper~1010
+    r20e = compression_upper_bound(length=1000, entropy_bits_per_symbol=1.0, method="shannon")
+    print(f"[20e] compression(N=1000, H=1.0, shannon): "
+          f"lower={r20e['shannon_lower_bound_bits']} upper={r20e['practical_upper_bound_bits']} "
+          f"K_note='{r20e['kolmogorov_note'][:40]}...'")
+    assert r20e["ok"] is True
+    assert r20e["shannon_lower_bound_bits"] == 1000.0
+    assert 1000 < r20e["practical_upper_bound_bits"] < 1020
+    assert "uncomputable" in r20e["kolmogorov_note"]
+
+    # [20f] invalid input rejection (共通 error 経路 sanity)
+    r20f1 = bekenstein_bound_bits(-1, 1)
+    r20f2 = landauer_min_energy_j(1, -1)
+    r20f3 = lloyd_computation_ceiling(0)
+    r20f4 = operator_space_size(1, 2)  # k < 2
+    r20f5 = compression_upper_bound(-1, 1, "shannon")
+    print(f"[20f] invalid input: bekenstein={not r20f1['ok']} landauer={not r20f2['ok']} "
+          f"lloyd={not r20f3['ok']} operator={not r20f4['ok']} compression={not r20f5['ok']}")
+    assert all(not r["ok"] for r in (r20f1, r20f2, r20f3, r20f4, r20f5))
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     print("v0.5.0-alpha SPIKE: import_external_session + SafetyGate + source field 追加 動作確認。")
+    print("v0.6.0-alpha: physics-limits pre-flight (Bekenstein/Landauer/Lloyd/op-space/compression) 動作確認。")
     return 0
 
 
