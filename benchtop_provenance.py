@@ -83,6 +83,19 @@ class ProvenanceRecord:
       attestation   : optional dict for external crypto attestation
                       (e.g. kya-os JOSE proof, RFC 9162 checkpoint receipt);
                       preserved as-is, verify is out-of-spike-scope
+      noise_floor_mW      : optional float, noise floor value captured just
+                            before this measurement (unit: mW). Default None.
+      noise_floor_taken_at: optional ISO 8601 UTC timestamp when noise_floor_mW
+                            was captured. Default None.
+      snr_ratio           : optional float, signal-to-noise ratio (Δ / noise_floor).
+                            Default None.
+
+    Noise floor / SNR field policy (2026-08-20, order principle):
+      Fields are placeholders only. Threshold for snr_ratio is deliberately
+      NOT hard-coded in this module. The digit magnitude of noise_floor_mW
+      must first be established by an actual NULL burn on real hardware;
+      only then may a threshold be written into any downstream check.
+      See [[feedback-one-reproduction-over-ten-unverified]]。
     """
     source: str
     ts: str
@@ -92,6 +105,9 @@ class ProvenanceRecord:
     instrument: dict[str, Any] | None = None
     raw: dict[str, Any] | None = None
     attestation: dict[str, Any] | None = None
+    noise_floor_mW: float | None = None
+    noise_floor_taken_at: str | None = None
+    snr_ratio: float | None = None
 
 
 @dataclass
@@ -344,6 +360,8 @@ def import_external_session(
             continue
 
         try:
+            _nf = raw_rec.get("noise_floor_mW")
+            _snr = raw_rec.get("snr_ratio")
             record = ProvenanceRecord(
                 source=source,
                 ts=str(raw_rec["ts"]),
@@ -353,6 +371,12 @@ def import_external_session(
                 instrument=raw_rec.get("instrument"),
                 raw=raw_rec.get("raw"),
                 attestation=raw_rec.get("attestation"),
+                noise_floor_mW=None if _nf is None else float(_nf),
+                noise_floor_taken_at=(
+                    None if raw_rec.get("noise_floor_taken_at") is None
+                    else str(raw_rec["noise_floor_taken_at"])
+                ),
+                snr_ratio=None if _snr is None else float(_snr),
             )
         except (TypeError, ValueError) as e:
             rejections.append({
