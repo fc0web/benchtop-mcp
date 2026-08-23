@@ -857,6 +857,16 @@ from benchtop_physics_limits import (  # noqa: E402
     compression_upper_bound as _pl_compression,
 )
 
+# v0.7.0-alpha (2026-08-23): olfact / biosensor mock spike
+# 藤本さん directive (a) 「benchtop-mcp v0.7 olfact connector v0.1 spike」 実装。
+# 対話 arc (虫触角 / 動物 / 植物センサ + AI に役立つか) 経由、 hardware 未取得
+# = 全 tool で hardware_available: False marker 徹底。
+from benchtop_olfact import (  # noqa: E402
+    list_probes as _ol_list_probes,
+    measure_eag as _ol_measure_eag,
+    probe_health as _ol_probe_health,
+)
+
 AUDIT_DIR = Path(os.environ.get("BENCHTOP_AUDIT_DIR", str(DATA_DIR / "audit")))
 _AUDIT_ENABLED = os.environ.get("BENCHTOP_AUDIT", "1").strip() not in ("0", "false", "no", "")
 _AUDIT: AuditLogWriter | None = None
@@ -891,7 +901,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.6.0-alpha",
+    version="0.7.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -914,6 +924,12 @@ server = MCPServer(
         "compression_upper_bound。 実 hardware 送出前の 単位付き算術 + 桁勘定 + 上界計算を "
         "LLM 単体で 誤りやすい 領域として MCP 化。 Kolmogorov K(x) uncomputable は siren-family "
         "pattern 回避で明示 disclaimer 付き。 全 pure calc (stdlib のみ、 状態なし)。"
+        "v0.7.0-alpha 追加 (SPIKE): olfact / biosensor mock 3 tool — list_probes / measure_eag / "
+        "probe_health。 生体嗅覚センサ (bio-hybrid / receptor-chip / bio-inspired 3 layer) の "
+        "interface skeleton、 hardware 未取得 = 全 tool で hardware_available: False marker、 "
+        "measure_eag は deterministic mock waveform (probe_id + odor_name hash seed)、 "
+        "probe_health は 3 layer 別 degradation model (linear / exponential / calibration-only)。 "
+        "STEP 1350 d8_verdict_from_measurement primitive を 3 値 subset で 参照 (verdict field)。"
     ),
 )
 
@@ -1439,6 +1455,104 @@ def compression_upper_bound(
     compression_ratio_min, is_upper_bound, kolmogorov_note, assumptions, ...
     """
     return _pl_compression(length, entropy_bits_per_symbol, method)
+
+
+# ---------------------------------------------------------------------------
+# v0.7.0-alpha (2026-08-23): olfact / biosensor mock spike (3 tools)
+# ---------------------------------------------------------------------------
+#   藤本さん directive (a) 「benchtop-mcp v0.7 olfact connector v0.1 spike」 実装。
+#   対話 arc 2026-08-23 (虫触角 / 動物 / 植物センサ + AI に役立つか) 3 turn 経由。
+#
+#   3 tool = list_probes / measure_eag / probe_health。
+#   3 layer = ① bio-hybrid (silkworm-antenna-a1、 7h 寿命)
+#             ② receptor-chip (mosquito-receptor-fet-b1、 0.5 ppb)
+#             ③ bio-inspired (sparse-e-nose-c1、 silicon)
+#
+#   ★ hardware 未取得 = 全 return dict で hardware_available: False + is_mock: True。
+#   ★ measure_eag は deterministic mock (probe_id + odor_name hash seed)、 実 physics
+#      模倣なし = interface skeleton のみ ([[feedback-super-naming-siren-family-pattern]])。
+#   ★ STEP 1350 d8_verdict_from_measurement primitive を 3 値 subset で 参照
+#      (TRUE if SNR≥threshold / NEITHER if SNR<threshold)。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def list_probes() -> dict[str, Any]:
+    """内蔵 mock probe registry の 一覧を返す。 全 probe は hardware_available: False。
+
+    3 probe (対話 arc で整理した 3 layer 各 1):
+      - silkworm-antenna-a1 (bio-hybrid、 7h hydrogel EAG)
+      - mosquito-receptor-fet-b1 (receptor-chip、 0.5 ppb CNT-FET)
+      - sparse-e-nose-c1 (bio-inspired、 silicon sparse coding)
+
+    Returns dict with: ok, probes (list), probe_count, hardware_available: False,
+    is_mock: True, honest_scope, related_step, source。
+    """
+    return _ol_list_probes()
+
+
+@server.tool()
+def measure_eag(
+    probe_id: str,
+    odor_name: str,
+    duration_s: float = 3.0,
+    sample_rate_hz: float = 100.0,
+    snr_threshold: float = 3.0,
+) -> dict[str, Any]:
+    """mock EAG (Electroantennogram) 測定。 probe_id + odor_name から deterministic
+    波形を生成、 SNR と D-FUMT₈ verdict (STEP 1350 mapping subset) を返す。
+
+    ★ v0.1 spike: 実 hardware 送出なし、 全 return dict で is_mock: True。
+    実 EAG physics (ion channel kinetics 等) を模倣していない = interface skeleton のみ。
+
+    Args:
+        probe_id: list_probes() の 'probe_id' field (例: 'silkworm-antenna-a1')。
+        odor_name: 提示 匂い名 (例: 'cis-3-hexenol')、 mock stimulus。
+        duration_s: 測定継続時間 (秒)、 default 3.0、 must be > 0。
+        sample_rate_hz: サンプリング周波数 (Hz)、 default 100.0、 must be > 0。
+        snr_threshold: D-FUMT₈ verdict 境界 (default 3.0、 STEP 1350 primitive と同)。
+
+    Returns dict with: ok, probe_id, probe_layer, odor_name, duration_s,
+    sample_rate_hz, sample_count, waveform_mv (list[float]), peak_mv,
+    amp_estimated_mv, noise_floor_mv, snr_ratio, snr_threshold,
+    verdict_d8 ('TRUE' or 'NEITHER'), verdict_d8_symbol ('⊤' or '〜'),
+    verdict_reason, is_mock: True, hardware_available: False, honest_scope,
+    d8_mapping_source, source。
+    """
+    return _ol_measure_eag(probe_id, odor_name, duration_s, sample_rate_hz, snr_threshold)
+
+
+@server.tool()
+def probe_health(
+    probe_id: str,
+    age_hours: float,
+    last_calibration_hours_ago: float = 0.0,
+    calibration_max_interval_hours: float = 24.0,
+) -> dict[str, Any]:
+    """probe 劣化 verdict。 age_hours + 校正経過時間から HEALTHY / DEGRADING /
+    EXPIRED / UNCALIBRATED を返す。
+
+    3 layer 別 degradation model:
+      ① bio-hybrid    = linear (hydrogel dehydration)
+      ② receptor-chip = exponential (protein denaturation)
+      ③ bio-inspired  = calibration-only (silicon、 生体劣化なし)
+
+    Args:
+        probe_id: list_probes() の 'probe_id' field。
+        age_hours: probe 開梱後経過時間 (時間)、 must be >= 0。
+        last_calibration_hours_ago: 最後の校正からの経過時間 (時間)、 default 0。
+        calibration_max_interval_hours: 校正有効期間 (時間)、 default 24 (daily calibration)。
+
+    Returns dict with: ok, probe_id, layer, layer_number, age_hours,
+    expected_lifetime_hours, age_ratio, health_score (0.0-1.0),
+    verdict ('HEALTHY' / 'DEGRADING' / 'EXPIRED' / 'UNCALIBRATED'),
+    verdict_reason, degradation_model, is_calibrated, last_calibration_hours_ago,
+    calibration_max_interval_hours, is_mock: True, hardware_available: False,
+    honest_scope, reference, source。
+    """
+    return _ol_probe_health(
+        probe_id, age_hours, last_calibration_hours_ago, calibration_max_interval_hours
+    )
 
 
 @server.tool()
@@ -2295,9 +2409,72 @@ def _selftest() -> int:
           f"lloyd={not r20f3['ok']} operator={not r20f4['ok']} compression={not r20f5['ok']}")
     assert all(not r["ok"] for r in (r20f1, r20f2, r20f3, r20f4, r20f5))
 
+    # ------------------------------------------------------------------
+    # [21] v0.7.0-alpha: olfact / biosensor mock spike (3 MCP tool wire)
+    # ------------------------------------------------------------------
+    #   MCP tool 層で module 実装との 一致 verify (module 側 selftest 35/35 PASS 済)。
+    print("\n--- [21] v0.7.0-alpha: olfact / biosensor mock spike (3 MCP tool wire) ---")
+
+    # [21a] list_probes: 3 probe registry
+    r21a = list_probes()
+    assert r21a["ok"] is True
+    assert r21a["probe_count"] == 3
+    assert r21a["hardware_available"] is False
+    assert r21a["is_mock"] is True
+    ids = {p["probe_id"] for p in r21a["probes"]}
+    assert ids == {"silkworm-antenna-a1", "mosquito-receptor-fet-b1", "sparse-e-nose-c1"}
+    print(f"[21a] list_probes: count={r21a['probe_count']} hw={r21a['hardware_available']} "
+          f"ids={sorted(ids)}")
+
+    # [21b] measure_eag: silkworm probe, valid odor → waveform + verdict
+    r21b = measure_eag(probe_id="silkworm-antenna-a1", odor_name="cis-3-hexenol",
+                      duration_s=3.0, sample_rate_hz=100.0)
+    assert r21b["ok"] is True
+    assert r21b["sample_count"] == 300
+    assert r21b["is_mock"] is True
+    assert r21b["hardware_available"] is False
+    assert r21b["verdict_d8"] in ("TRUE", "NEITHER")
+    print(f"[21b] measure_eag(silkworm, cis-3-hexenol, 3s@100Hz): "
+          f"amp={r21b['amp_estimated_mv']:.3f}mV noise={r21b['noise_floor_mv']:.3f}mV "
+          f"snr={r21b['snr_ratio']:.1f} verdict={r21b['verdict_d8']}/{r21b['verdict_d8_symbol']}")
+
+    # [21c] measure_eag: determinism (chat-Claude Osmo Principal Odor Map reproducibility 原理)
+    r21c1 = measure_eag("mosquito-receptor-fet-b1", "octenol", 1.0, 100.0)
+    r21c2 = measure_eag("mosquito-receptor-fet-b1", "octenol", 1.0, 100.0)
+    assert r21c1["waveform_mv"] == r21c2["waveform_mv"]
+    print(f"[21c] measure_eag determinism: waveform_equal={r21c1['waveform_mv'] == r21c2['waveform_mv']}")
+
+    # [21d] probe_health: bio-hybrid age progression (0h → 3.5h → 10.5h)
+    r21d0 = probe_health("silkworm-antenna-a1", age_hours=0.0)
+    r21d1 = probe_health("silkworm-antenna-a1", age_hours=3.5, last_calibration_hours_ago=1.0)
+    r21d2 = probe_health("silkworm-antenna-a1", age_hours=10.5, last_calibration_hours_ago=1.0)
+    assert r21d0["verdict"] == "HEALTHY"
+    assert r21d1["verdict"] == "DEGRADING"
+    assert r21d2["verdict"] == "EXPIRED"
+    print(f"[21d] probe_health(silkworm): 0h={r21d0['verdict']} 3.5h={r21d1['verdict']} "
+          f"10.5h={r21d2['verdict']} (linear-hydrogel model)")
+
+    # [21e] probe_health: bio-inspired silicon (no biological aging)
+    r21e = probe_health("sparse-e-nose-c1", age_hours=1000.0, last_calibration_hours_ago=1.0)
+    assert r21e["verdict"] == "HEALTHY"
+    assert r21e["health_score"] == 1.0
+    assert r21e["degradation_model"] == "calibration-only-silicon"
+    print(f"[21e] probe_health(sparse-e-nose, 1000h): verdict={r21e['verdict']} "
+          f"model={r21e['degradation_model']}")
+
+    # [21f] invalid input rejection (unknown probe / negative args)
+    r21f1 = measure_eag("unknown", "odor", 1.0, 100.0)
+    r21f2 = measure_eag("silkworm-antenna-a1", "odor", -1, 100)
+    r21f3 = probe_health("unknown", 1.0)
+    r21f4 = probe_health("silkworm-antenna-a1", -1.0)
+    assert all(not r["ok"] for r in (r21f1, r21f2, r21f3, r21f4))
+    print(f"[21f] invalid input rejected: unknown_probe={not r21f1['ok']} neg_dur={not r21f2['ok']} "
+          f"unknown_probe_health={not r21f3['ok']} neg_age={not r21f4['ok']}")
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     print("v0.5.0-alpha SPIKE: import_external_session + SafetyGate + source field 追加 動作確認。")
     print("v0.6.0-alpha: physics-limits pre-flight (Bekenstein/Landauer/Lloyd/op-space/compression) 動作確認。")
+    print("v0.7.0-alpha SPIKE: olfact / biosensor mock (list_probes / measure_eag / probe_health) 動作確認。")
     return 0
 
 

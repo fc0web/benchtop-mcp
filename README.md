@@ -4,6 +4,12 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
+**Version**: 0.7.0-alpha (2026-08-23, SPIKE) — **★ olfact / biosensor mock layer**: 生体嗅覚センサ (bio-hybrid / receptor-chip / bio-inspired 3 layer) の interface skeleton を benchtop に 追加。 新 tool 3 個: `list_probes` (内蔵 mock probe registry 3 probe) + `measure_eag` (deterministic mock EAG waveform、 probe_id + odor_name の hashlib.md5 seed で cross-process 再現可能、 D-FUMT₈ verdict subset for STEP 1350 mapping) + `probe_health` (3 layer 別 degradation model: linear-hydrogel / exponential-protein-denaturation / calibration-only-silicon)。 藤本さん directive (2026-08-23 対話 arc 「虫の触覚センサー / 動物 / 植物センサー」 + 「AI に役立つか」 経由) 実装。 ★ **hardware 未取得** = 全 tool で `hardware_available: False` + `is_mock: True` marker、 実 EAG physics (ion channel kinetics 等) 模倣なし = interface skeleton のみ。 実 hardware 統合 (フロントエンドアンプ + 恒温恒湿 + オルファクトメータ) は 別 STEP candidate。 selftest phase [21a-21f] 追加、 module 単体 35 assertion + wire 6 phase 全 PASS。 [[feedback-super-naming-siren-family-pattern]] 適用 (mock 誤読予防)、 [[feedback-world-uniqueness-claim-controllable]] 継承 (「世界初」 主張ゼロ、 novelty は Rei stack 内 benchtop 新 domain 追加のみ)。
+
+**Version**: 0.6.0-alpha (2026-08-20, SPIKE) — **★ physics-limits pre-flight layer** (5 tool): `bekenstein_bound_bits` / `landauer_min_energy_j` / `lloyd_computation_ceiling` / `operator_space_size` / `compression_upper_bound`。 LLM が 単位付き算術 + 桁勘定 + 上界計算で 誤りやすい 領域を pure calc (stdlib のみ) の MCP tool に落とし、 実 hardware SCPI 送出の pre-flight check として 使う。 SafetyGate (v0.5) と 相補: 事前規模計算 → SafetyGate。 Kolmogorov K(x) uncomputable は siren-family pattern 回避で明示 disclaimer 付き。 selftest phase [20a-20f]。
+
+**Version**: 0.5.0-alpha (2026-08-19, SPIKE) — **★ provenance layer + SafetyGate**: `import_external_session` で 他社 MCP server (Keysight/rigol/lecroy/kya-os wrapped) の 計測記録を benchtop に 取り込み + SafetyGate で SCPI-argument level の hazard (Kikusui PLZ-5W CR mode Siemens/Ω 混同 = 短絡 hazard 等) を 静的検出。 4 agent verify (2026-08-19) 経由の 「機器層/記録層 分割」 戦略の 記録層 実装。 selftest phase [19a-19f]。
+
 **Version**: 0.4.0 (2026-08-17) — **★ 実験ノート (experiment notebook) 統合**: Session dataclass に `subject` (被測定物 ID) / `environment` (温湿度 dict) / `instrument_config` (装置設定 dict) / `mystery_id` (rei-aios link) 全 optional field 追加。 新 tool 2 個: `find_similar_sessions` (subject / mystery_id / environment key/value + tolerance で 過去 session 絞り込み) + `regression_check` (baseline vs current の mean_delta / stdev_ratio tolerance-based 劣化検出)。 chat-Claude 2026-08-17 arc 「実験ノート MCP」 提案 (benchtop = 手を動かす、 rei-aios = 考える、 その間の 空白) を benchtop 内 拡張として 実装 (新 MCP 追加せず 「深化」 discipline 準拠)。 backward compat: 旧 JSON (v0.3.0 以前) も 読める、 新 field default None。 selftest phase [17] (実験ノート + find_similar_sessions 5 case) + [18a-18c] (regression_check 3 case) 追加、 計 18 phase 全 PASS。
 
 **Version**: 0.3.0 (2026-08-17) — **★ major: audit log hash chain 追加** (Rei-Automator STEP 1340 primitive port)。 全 tool 呼び出しが `~/.benchtop-mcp/audit/audit.jsonl` に append-only JSONL + sha256 prev-hash chain で 記録され、 新 tool `verify_audit_chain` で 改竄検出可能。 chat-Claude 2026-08-17 arc 「証跡が価値になる領域」 (ISO/IEC 17025 校正 / GMP 医薬品製造記録 / 監査対応) 用途。 session store (`~/.benchtop-mcp/session_*.json`) と 別 store で 併存、 audit log は 削除禁止 (append-only)。 `BENCHTOP_AUDIT=0` で 無効化可能、 `BENCHTOP_AUDIT_DIR` で 保存先変更可能。 selftest phase [16a-16d] で genesis chain / continuation / tamper detection / MCP tool level を 各 verify。
@@ -51,6 +57,9 @@ v0.2.4 は `search_sessions(since='YYYY-MM-DD')` の 解釈を **UTC 文字列�
 | `verify_audit_chain` *(v0.3.0)* | audit log の sha256 prev-hash chain 整合性を検証 (改竄検出) |
 | `find_similar_sessions` *(v0.4.0)* | subject / mystery_id / environment key/value + tolerance で 過去 session を 絞り込み (「3ヶ月前の 同じ条件と 比べて」 用) |
 | `regression_check` *(v0.4.0)* | baseline vs current の mean_delta / stdev_ratio を tolerance-based で 判定 (校正基準からの 劣化検出) |
+| `list_probes` *(v0.7.0-alpha)* | 生体嗅覚センサ mock probe registry の 一覧 (3 layer: bio-hybrid / receptor-chip / bio-inspired、 全 `hardware_available: False`) |
+| `measure_eag` *(v0.7.0-alpha)* | mock EAG (Electroantennogram) 測定、 deterministic waveform (hashlib.md5 seed 由来)、 SNR + D-FUMT₈ verdict (STEP 1350 mapping subset) |
+| `probe_health` *(v0.7.0-alpha)* | 生体劣化 verdict (HEALTHY/DEGRADING/EXPIRED/UNCALIBRATED)、 3 layer 別 degradation model |
 
 存在しない `session_id` を渡した場合、`plot_session` / `analyze_session` / `compare_sessions` / `export_session_csv` は例外を投げずに `{"error": "session_not_found", "session_id": "...", "hint": "..."}` を返す (v0.2.1)。AI から見て tool 呼び出しが例外で落ちるより、error 情報を含む dict が返る方がリトライ or 別 tool に自然に繋がる。
 
