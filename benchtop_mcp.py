@@ -936,6 +936,18 @@ from benchtop_olfact import (  # noqa: E402
     probe_health as _ol_probe_health,
 )
 
+# v0.8.0-alpha (2026-08-26): Akizuki wire-up 3 layer mock spike
+# 藤本さん directive 「(1)(2)(3) を 順番に」 実装、 Rei stack STEP 1406 秋月
+# I2C/SPI/UART wire-up 候補 list から 3 SKU pilot (BME280 環境 / BNO055 慣性 /
+# VL53L1X ToF 距離) を benchtop mock として 追加。 hardware 未取得 = 全 tool で
+# hardware_available: False marker 徹底、 STEP 1396 olfact pattern 継承。
+from benchtop_akizuki_wireup import (  # noqa: E402
+    list_akizuki_probes as _ak_list_probes,
+    measure_environment as _ak_measure_environment,
+    measure_orientation as _ak_measure_orientation,
+    measure_distance as _ak_measure_distance,
+)
+
 AUDIT_DIR = Path(os.environ.get("BENCHTOP_AUDIT_DIR", str(DATA_DIR / "audit")))
 _AUDIT_ENABLED = os.environ.get("BENCHTOP_AUDIT", "1").strip() not in ("0", "false", "no", "")
 _AUDIT: AuditLogWriter | None = None
@@ -970,7 +982,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.7.0-alpha",
+    version="0.8.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -999,6 +1011,12 @@ server = MCPServer(
         "measure_eag は deterministic mock waveform (probe_id + odor_name hash seed)、 "
         "probe_health は 3 layer 別 degradation model (linear / exponential / calibration-only)。 "
         "STEP 1350 d8_verdict_from_measurement primitive を 3 値 subset で 参照 (verdict field)。"
+        "v0.8.0-alpha 追加 (SPIKE): Akizuki wire-up 3 layer mock 4 tool — list_akizuki_probes / "
+        "measure_environment (BME280) / measure_orientation (BNO055) / measure_distance (VL53L1X)。 "
+        "Rei stack STEP 1406 秋月 I2C/SPI/UART wire-up 候補 list から 3 SKU pilot、 hardware 未取得 "
+        "= 全 tool hardware_available: False、 deterministic mock (probe_id + tag hash seed)、 "
+        "実 sensor physics (Bosch calibration / on-chip fusion / SPAD photon counting) は 模倣なし = "
+        "interface skeleton のみ。 環境/慣性/距離 3 gap 埋めの STEP 1406 導入 arc。"
     ),
 )
 
@@ -1622,6 +1640,119 @@ def probe_health(
     return _ol_probe_health(
         probe_id, age_hours, last_calibration_hours_ago, calibration_max_interval_hours
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.8.0-alpha (2026-08-26): Akizuki wire-up 3 layer mock spike (4 tools)
+# ---------------------------------------------------------------------------
+#   藤本さん directive 「(1)(2)(3) を 順番に」 実装、 Rei stack STEP 1406 秋月
+#   I2C/SPI/UART wire-up 候補 list から 3 SKU pilot を benchtop mock として 追加。
+#
+#   4 tool = list_akizuki_probes / measure_environment / measure_orientation / measure_distance
+#   3 layer = ① environment (BME280 温湿度気圧、 Akizuki 109421 ¥1,180)
+#             ② inertial   (BNO055 9軸 fusion、 Akizuki 116996 ¥3,850)
+#             ③ distance   (VL53L1X ToF、 Akizuki 114249 ¥1,780)
+#
+#   ★ hardware 未取得 = 全 return dict で hardware_available: False + is_mock: True。
+#   ★ mock 値は deterministic (probe_id + tag hash seed 由来)、 実 sensor physics
+#      (Bosch calibration / on-chip fusion / SPAD) 模倣なし = interface skeleton のみ
+#      ([[feedback-super-naming-siren-family-pattern]])。
+#   ★ STEP 1350 d8_verdict_from_measurement primitive を 2 値 subset で 参照。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def list_akizuki_probes() -> dict[str, Any]:
+    """内蔵 mock probe registry (Akizuki wire-up 3 SKU) の 一覧を返す。
+    全 probe は hardware_available: False。
+
+    3 probe (STEP 1406 wire-up 候補 list から 各 layer 代表 SKU 選定):
+      - bme280-env-a1 (environment、 BME280 温湿度気圧、 Akizuki 109421)
+      - bno055-imu-b1 (inertial、 BNO055 9軸 fusion、 Akizuki 116996)
+      - vl53l1x-tof-c1 (distance、 VL53L1X ToF、 Akizuki 114249)
+
+    Returns dict with: ok, probes (list, with akizuki_code + price_jpy + range),
+    probe_count, hardware_available: False, is_mock: True, honest_scope,
+    related_step, source。
+    """
+    return _ak_list_probes()
+
+
+@server.tool()
+def measure_environment(
+    probe_id: str,
+    condition_tag: str = "room-default",
+) -> dict[str, Any]:
+    """mock 環境測定 (BME280 style: 温度 / 湿度 / 気圧)。 probe_id + condition_tag から
+    deterministic な 3 値を生成、 BME280 datasheet range 内 か verdict を返す。
+
+    ★ v0.1 spike: 実 hardware 送出なし、 全 return dict で is_mock: True。
+    実 BME280 physics (Bosch calibration curve 等) を 模倣していない = interface skeleton のみ。
+
+    Args:
+        probe_id: list_akizuki_probes() の 'probe_id' (現状 'bme280-env-a1' のみ)。
+        condition_tag: 想定 環境 tag (例: 'room-default' / 'outdoor-summer' / 'freezer')。
+
+    Returns dict with: ok, probe_id, probe_layer, part_number, condition_tag,
+    temperature_c, humidity_pct, pressure_hpa, in_range_all,
+    verdict_d8 ('TRUE' or 'NEITHER'), verdict_d8_symbol, verdict_reason,
+    is_mock: True, hardware_available: False, honest_scope,
+    d8_mapping_source, source。
+    """
+    return _ak_measure_environment(probe_id, condition_tag)
+
+
+@server.tool()
+def measure_orientation(
+    probe_id: str,
+    motion_tag: str = "static-level",
+) -> dict[str, Any]:
+    """mock 慣性測定 (BNO055 style: quaternion + euler + linear_acc + magnetic)。
+    probe_id + motion_tag から deterministic な orientation を生成、
+    quaternion は unit-norm 保証、 euler → ZYX 変換で 単位化。
+
+    ★ v0.1 spike: 実 hardware 送出なし、 全 return dict で is_mock: True。
+    実 BNO055 on-chip fusion (Cortex-M0+ で Madgwick/Mahony 相当) 模倣なし = skeleton のみ。
+
+    Args:
+        probe_id: list_akizuki_probes() の 'probe_id' (現状 'bno055-imu-b1' のみ)。
+        motion_tag: 想定 動作 tag (例: 'static-level' / 'tilt-30deg-x' / 'shake')。
+
+    Returns dict with: ok, probe_id, probe_layer, part_number, motion_tag,
+    quaternion {w, x, y, z}, euler_deg {roll, pitch, yaw},
+    linear_acc_m_s2 {x, y, z}, magnetic_uT {x, y, z},
+    calibration_status {sys, gyro, acc, mag}, quaternion_norm, is_unit_quat,
+    is_mock: True, hardware_available: False, honest_scope,
+    d8_mapping_source, source。
+    """
+    return _ak_measure_orientation(probe_id, motion_tag)
+
+
+@server.tool()
+def measure_distance(
+    probe_id: str,
+    target_tag: str = "wall-2m",
+    timing_budget_ms: float = 100.0,
+) -> dict[str, Any]:
+    """mock ToF 距離測定 (VL53L1X style)。 probe_id + target_tag から deterministic
+    距離 (mm) を生成、 VL53L1X datasheet 有効範囲 (30〜4000mm) 内 か verdict を返す。
+
+    ★ v0.1 spike: 実 hardware 送出なし、 全 return dict で is_mock: True。
+    実 VL53L1X physics (940nm laser SPAD photon counting) 模倣なし = skeleton のみ。
+    timing_budget は 実 hardware では 精度 trade-off だが、 本 mock では 値に影響なし。
+
+    Args:
+        probe_id: list_akizuki_probes() の 'probe_id' (現状 'vl53l1x-tof-c1' のみ)。
+        target_tag: 想定 対象 tag (例: 'wall-2m' / 'ceiling-3m' / 'obstacle-close-50cm')。
+        timing_budget_ms: VL53L1X の 測定 budget (20-500 ms)、 default 100 ms。
+
+    Returns dict with: ok, probe_id, probe_layer, part_number, target_tag,
+    distance_mm, timing_budget_ms, range_status ('VALID'/'TOO_CLOSE'/'TOO_FAR'),
+    in_range, verdict_d8 ('TRUE' or 'NEITHER'), verdict_d8_symbol,
+    verdict_reason, is_mock: True, hardware_available: False, honest_scope,
+    d8_mapping_source, source。
+    """
+    return _ak_measure_distance(probe_id, target_tag, timing_budget_ms)
 
 
 @server.tool()
@@ -2567,10 +2698,74 @@ def _selftest() -> int:
     print(f"[21f] invalid input rejected: unknown_probe={not r21f1['ok']} neg_dur={not r21f2['ok']} "
           f"unknown_probe_health={not r21f3['ok']} neg_age={not r21f4['ok']}")
 
+    # ------------------------------------------------------------------
+    # [22] v0.8.0-alpha: Akizuki wire-up 3 layer mock spike (4 MCP tool wire)
+    # ------------------------------------------------------------------
+    #   MCP tool 層で module 実装との 一致 verify (module 側 selftest 9/9 PASS 済)。
+    print("\n--- [22] v0.8.0-alpha: Akizuki wire-up 3 layer mock spike (4 MCP tool wire) ---")
+
+    # [22a] list_akizuki_probes: 3 probe registry
+    r22a = list_akizuki_probes()
+    assert r22a["ok"] is True
+    assert r22a["probe_count"] == 3
+    assert r22a["hardware_available"] is False
+    assert r22a["is_mock"] is True
+    ak_ids = {p["probe_id"] for p in r22a["probes"]}
+    assert ak_ids == {"bme280-env-a1", "bno055-imu-b1", "vl53l1x-tof-c1"}
+    print(f"[22a] list_akizuki_probes: count={r22a['probe_count']} hw={r22a['hardware_available']} "
+          f"ids={sorted(ak_ids)}")
+
+    # [22b] measure_environment: BME280 mock, in-range
+    r22b = measure_environment(probe_id="bme280-env-a1", condition_tag="room-default")
+    assert r22b["ok"] is True
+    assert r22b["is_mock"] is True
+    assert r22b["hardware_available"] is False
+    assert r22b["verdict_d8"] == "TRUE"
+    print(f"[22b] measure_environment(bme280, room-default): t={r22b['temperature_c']}C "
+          f"h={r22b['humidity_pct']}% p={r22b['pressure_hpa']}hPa verdict={r22b['verdict_d8']}")
+
+    # [22c] measure_environment: determinism
+    r22c1 = measure_environment("bme280-env-a1", "outdoor-summer")
+    r22c2 = measure_environment("bme280-env-a1", "outdoor-summer")
+    assert r22c1["temperature_c"] == r22c2["temperature_c"]
+    assert r22c1["pressure_hpa"] == r22c2["pressure_hpa"]
+    print(f"[22c] measure_environment determinism: temp+pressure equal")
+
+    # [22d] measure_orientation: BNO055 mock, unit quaternion
+    r22d = measure_orientation(probe_id="bno055-imu-b1", motion_tag="static-level")
+    assert r22d["ok"] is True
+    assert r22d["is_mock"] is True
+    assert r22d["is_unit_quat"] is True
+    q22 = r22d["quaternion"]
+    q22_norm = math.sqrt(q22["w"]**2 + q22["x"]**2 + q22["y"]**2 + q22["z"]**2)
+    assert abs(q22_norm - 1.0) < 1e-4
+    print(f"[22d] measure_orientation(bno055, static-level): q_norm={q22_norm:.6f} "
+          f"euler_roll={r22d['euler_deg']['roll']}")
+
+    # [22e] measure_distance: VL53L1X mock, range check
+    r22e = measure_distance(probe_id="vl53l1x-tof-c1", target_tag="wall-2m", timing_budget_ms=100.0)
+    assert r22e["ok"] is True
+    assert r22e["is_mock"] is True
+    assert r22e["range_status"] in ("VALID", "TOO_CLOSE", "TOO_FAR")
+    assert r22e["verdict_d8"] in ("TRUE", "NEITHER")
+    print(f"[22e] measure_distance(vl53l1x, wall-2m): d={r22e['distance_mm']}mm "
+          f"status={r22e['range_status']} verdict={r22e['verdict_d8']}")
+
+    # [22f] cross-layer misuse rejection
+    r22f1 = measure_orientation("bme280-env-a1", "any")
+    r22f2 = measure_environment("bno055-imu-b1", "any")
+    r22f3 = measure_distance("bme280-env-a1", "any")
+    r22f4 = measure_environment("unknown-probe", "any")
+    r22f5 = measure_distance("vl53l1x-tof-c1", "wall", timing_budget_ms=1000.0)
+    assert all(not r["ok"] for r in (r22f1, r22f2, r22f3, r22f4, r22f5))
+    print(f"[22f] invalid input rejected: cross_layer=3/3, unknown_probe={not r22f4['ok']}, "
+          f"timing_out_of_range={not r22f5['ok']}")
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     print("v0.5.0-alpha SPIKE: import_external_session + SafetyGate + source field 追加 動作確認。")
     print("v0.6.0-alpha: physics-limits pre-flight (Bekenstein/Landauer/Lloyd/op-space/compression) 動作確認。")
     print("v0.7.0-alpha SPIKE: olfact / biosensor mock (list_probes / measure_eag / probe_health) 動作確認。")
+    print("v0.8.0-alpha SPIKE: Akizuki wire-up 3 layer mock (env/IMU/ToF) 動作確認。")
     return 0
 
 
