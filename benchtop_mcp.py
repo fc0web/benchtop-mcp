@@ -264,6 +264,54 @@ def parse_line(line: str) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
+def _parse_ts(value: Any) -> float | None:
+    """ISO8601 文字列 / epoch 数値 のどちらでも epoch 秒 (float) に正規化する。
+    解釈できない場合は None (呼び出し側で 「不明」 として扱うこと)。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _session_duration_s(session: "Session") -> float | None:
+    """session の経過秒を返す。't' 不在でも KeyError にしない。
+
+    native capture (measure) の row は相対秒 `t` を持つが、v0.5.0-alpha の
+    import_external_session 由来の row は絶対時刻 `ts` しか持たない。
+    旧実装は `rows[-1]["t"]` を無条件参照していたため、import 由来 session を
+    analyze / compare_sessions / regression_check に渡すと KeyError: 't' で
+    落ちていた (2026-08-22 観測、2026-08-25 特定)。
+
+    優先順: `t` があればそれ、無ければ `ts` の差分から復元、どちらも無ければ
+    None ("計測不能" であって 0.0 ではない)。
+    """
+    if not session.rows:
+        return 0.0
+    last = session.rows[-1]
+    if "t" in last:
+        try:
+            return round(float(last["t"]), 3)
+        except (TypeError, ValueError):
+            pass
+    t0 = _parse_ts(session.rows[0].get("ts"))
+    t1 = _parse_ts(last.get("ts"))
+    if t0 is not None and t1 is not None:
+        return round(t1 - t0, 3)
+    return None
+
+
 @dataclass
 class Session:
     id: str
@@ -323,6 +371,27 @@ def load_session(session_id: str) -> Session:
     known_fields = set(Session.__dataclass_fields__.keys())
     filtered = {k: v for k, v in raw.items() if k in known_fields}
     return Session(**filtered)
+
+
+def _resolve_sid(sid: str, session_id: str) -> str | dict[str, Any]:
+    """`sid` / `session_id` のどちらで渡されても セッション ID を取り出す。
+
+    2026-08-25: remote-devices MCP proxy 経由で呼ぶと、`session_id` という名前の
+    top-level 引数が proxy 自身の session routing field と衝突して **無音で剥がされ**、
+    サーバ側には届かない (同じ呼び出しの `width` は届いていた、で切り分け済み)。
+    根本原因は proxy 側だが別 repo・別スコープなので、こちらは正名を `sid` に移し、
+    `session_id` を別名として残す (直結 Claude Desktop の既存呼び出しは無変更で動く)。
+
+    どちらも空なら structured error dict を返す (例外は投げない = 既存 contract 維持)。
+    """
+    target = (sid or session_id or "").strip()
+    if not target:
+        return {
+            "ok": False,
+            "error": "session ID is required — pass it as 'sid' (preferred) or 'session_id'",
+            "hint": "list_sessions() で ID を確認してください",
+        }
+    return target
 
 
 def _load_session_or_error(session_id: str) -> Session | dict[str, Any]:
@@ -451,7 +520,7 @@ class Bench:
             "note": session.note,
             "n_rows": len(session.rows),
             "skipped": session.skipped,
-            "duration_s": round(session.rows[-1]["t"], 3) if session.rows else 0.0,
+            "duration_s": _session_duration_s(session),
             "partial": session.aborted_at is not None,
             "abort_reason": session.abort_reason,
             "channels": {},
@@ -1562,14 +1631,23 @@ def list_sessions(limit: int = 30) -> dict[str, Any]:
 
 
 @server.tool()
-def analyze_session(session_id: str) -> dict[str, Any]:
+def analyze_session(sid: str = "", session_id: str = "") -> dict[str, Any]:
     """保存済みセッションをチャンネルごとに統計解析する。
 
     件数・平均・標準偏差・最小/最大・ドリフト（最終値-初期値）を返し、
     平均から3σ以上離れた点を外れ値として列挙する。
     装置の異常や測定のばらつきを判断するために使う。
     存在しない session_id は structured error dict を返す (例外は投げない)。
+
+    引数名について (2026-08-25): セッション ID は **`sid`** で渡すこと。
+    `session_id` は後方互換の別名。remote-devices MCP proxy 経由だと
+    `session_id` という名前の引数が proxy 側の routing field と衝突して
+    無音で剥がされ、サーバに届かない。
     """
+    _sid = _resolve_sid(sid, session_id)
+    if isinstance(_sid, dict):
+        return _sid
+    session_id = _sid
     s = _load_session_or_error(session_id)
     if isinstance(s, dict):
         return s
@@ -1577,15 +1655,24 @@ def analyze_session(session_id: str) -> dict[str, Any]:
 
 
 @server.tool()
-def export_session_csv(session_id: str, out_path: str) -> dict[str, Any]:
+def export_session_csv(out_path: str, sid: str = "", session_id: str = "") -> dict[str, Any]:
     """保存済みセッションを CSV ファイルに書き出す。
 
     存在しない session_id は structured error dict を返す (例外は投げない)。
 
     Args:
-        session_id: 対象のセッションID。
+        sid: 対象のセッションID (別名 `session_id` も可)。
         out_path: 書き出し先のファイルパス。例: '/tmp/run1.csv'
+
+    引数名について (2026-08-25): セッション ID は **`sid`** で渡すこと。
+    `session_id` は後方互換の別名。remote-devices MCP proxy 経由だと
+    `session_id` という名前の引数が proxy 側の routing field と衝突して
+    無音で剥がされ、サーバに届かない。
     """
+    _sid = _resolve_sid(sid, session_id)
+    if isinstance(_sid, dict):
+        return _sid
+    session_id = _sid
     s = _load_session_or_error(session_id)
     if isinstance(s, dict):
         _write_audit(action="export_session_csv", target=session_id, result="error",
@@ -1604,7 +1691,7 @@ def export_session_csv(session_id: str, out_path: str) -> dict[str, Any]:
 
 
 @server.tool()
-def plot_session(session_id: str, width: int = 60) -> dict[str, Any]:
+def plot_session(width: int = 60, sid: str = "", session_id: str = "") -> dict[str, Any]:
     """保存済みセッションを ASCII スパークライン (▁▂▃▄▅▆▇█) で視覚化する。
 
     各チャンネル別に、値の時系列を Unicode ブロック文字 8 段階で表現し、
@@ -1613,10 +1700,19 @@ def plot_session(session_id: str, width: int = 60) -> dict[str, Any]:
     存在しない session_id は structured error dict を返す (例外は投げない)。
 
     Args:
-        session_id: 対象のセッションID。
+        sid: 対象のセッションID (別名 `session_id` も可)。
         width: スパークラインの横幅（サンプル数がこれより多ければ平均でビン化）。
                既定は 60。1 以上を指定すること。
+
+    引数名について (2026-08-25): セッション ID は **`sid`** で渡すこと。
+    `session_id` は後方互換の別名。remote-devices MCP proxy 経由だと
+    `session_id` という名前の引数が proxy 側の routing field と衝突して
+    無音で剥がされ、サーバに届かない。
     """
+    _sid = _resolve_sid(sid, session_id)
+    if isinstance(_sid, dict):
+        return _sid
+    session_id = _sid
     s = _load_session_or_error(session_id)
     if isinstance(s, dict):
         return s

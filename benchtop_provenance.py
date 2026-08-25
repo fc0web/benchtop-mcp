@@ -421,6 +421,27 @@ def import_external_session(
     )
 
 
+def _parse_ts(value: Any) -> float | None:
+    """ISO8601 文字列 / epoch 数値 のどちらでも epoch 秒 (float) に正規化する。
+    解釈できない値は None を返す (呼び出し側で 「不明」 として扱うこと)。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def build_session_dict_from_import(
     result: ImportResult,
     source: str,
@@ -448,9 +469,18 @@ def build_session_dict_from_import(
             if ch not in all_channels:
                 all_channels.append(ch)
 
+    # v0.5.1 fix (2026-08-25): native capture の row は相対秒 `t` を持つが、
+    # import 由来の row は絶対時刻 `ts` しか書いていなかった。Bench.analyze() が
+    # rows[-1]["t"] を無条件参照するため、import した session を analyze_session /
+    # compare_sessions / regression_check に渡すと KeyError: 't' で落ちていた。
+    # `ts` は情報として残したまま、先頭 record からの相対秒を `t` として併記する。
+    t0 = _parse_ts(accepted_records[0]["ts"]) if accepted_records else None
     rows = []
     for r in accepted_records:
-        row = {"ts": r["ts"]}
+        row: dict[str, Any] = {"ts": r["ts"]}
+        t_abs = _parse_ts(r["ts"])
+        if t0 is not None and t_abs is not None:
+            row["t"] = round(t_abs - t0, 4)
         for ch, v in r.get("values", {}).items():
             row[ch] = v
         rows.append(row)
