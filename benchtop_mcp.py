@@ -959,6 +959,16 @@ from benchtop_akizuki_chem import (  # noqa: E402
     measure_voc_index as _ch_measure_voc,
 )
 
+# v0.9.1-alpha (2026-08-27): Akizuki UART chemistry layer mock spike
+# Rei stack STEP 1419 continuation of STEP 1416、 STEP 1408 excluded_from_v09 の
+# uart_co2 candidate (MH-Z19C Winsen NDIR CO2 UART 9600 baud、 Akizuki 116142)
+# を 別 module で mock 追加、 STEP 1416 akizuki_chem I2C pattern の UART 兄弟実装。
+# hardware 未取得 = 全 tool で hardware_available: False + is_packet_synthetic: True。
+from benchtop_akizuki_uart_chem import (  # noqa: E402
+    list_uart_chem_probes as _uc_list_probes,
+    measure_co2_uart_ndir as _uc_measure_co2,
+)
+
 AUDIT_DIR = Path(os.environ.get("BENCHTOP_AUDIT_DIR", str(DATA_DIR / "audit")))
 _AUDIT_ENABLED = os.environ.get("BENCHTOP_AUDIT", "1").strip() not in ("0", "false", "no", "")
 _AUDIT: AuditLogWriter | None = None
@@ -993,7 +1003,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.9.0-alpha",
+    version="0.9.1-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -1034,6 +1044,12 @@ server = MCPServer(
         "deterministic mock (probe_id + tag hash seed)、 実 sensor physics (光音響 phonon 共鳴 / SnO2 "
         "表面吸着) は 模倣なし = interface skeleton のみ。 UART CO2 (MH-Z19C/MH-Z14B) / Analog 系 "
         "(TGS/MQ/MG812) は v0.10+ candidate (可燃性 MQ 系は SafetyGate 拡張と 同時実装予定)。"
+        "v0.9.1-alpha 追加 (SPIKE): Akizuki UART chemistry layer mock 2 tool — list_uart_chem_probes / "
+        "measure_co2_uart_ndir (MH-Z19C)。 STEP 1419 continuation of STEP 1416、 STEP 1408 "
+        "excluded_from_v09.uart_co2 candidate の Winsen MH-Z19C NDIR (UART 9600 baud 9-byte packet "
+        "with Winsen checksum formula) を pilot、 hardware 未取得 = hardware_available:False + "
+        "is_packet_synthetic:True marker、 実 UART serial + IR 光量減衰 検出 は 模倣なし = interface "
+        "skeleton のみ。 9-byte packet は seed から 決定的合成 (byte-identical だが 実測性ゼロ)。"
     ),
 )
 
@@ -1862,6 +1878,72 @@ def measure_voc_index(
     honest_scope, d8_mapping_source, principle, source。
     """
     return _ch_measure_voc(probe_id, condition_tag)
+
+
+# ---------------------------------------------------------------------------
+# v0.9.1-alpha (2026-08-27): Akizuki UART chemistry layer mock spike (2 tools)
+# ---------------------------------------------------------------------------
+#   Rei stack STEP 1419 continuation of STEP 1416、 STEP 1408 excluded_from_v09 の
+#   uart_co2 candidate (Winsen MH-Z19C UART) を pilot 実装。
+#
+#   2 tool = list_uart_chem_probes / measure_co2_uart_ndir
+#   1 SKU  = MH-Z19C (Akizuki 116142 ¥4,580 UART 9600 baud NDIR CO2 400-5000 ppm)
+#
+#   ★ hardware 未取得 = 全 return dict で hardware_available: False + is_mock: True +
+#     is_packet_synthetic: True (mock 9-byte packet は seed 合成、 byte-identical だが 実測性ゼロ)。
+#   ★ Winsen datasheet 9-byte packet format 準拠 (0xFF start + 0x86 response marker +
+#     CO2 high/low + temp + 3-byte reserved + checksum with Winsen 独自 formula)。
+#   ★ v0.9.2+ candidate: MH-Z14B (Akizuki 116388、 同 protocol、 range 違い)。
+#   ★ STEP 1350 d8_verdict_from_measurement primitive を 2 値 subset で 参照。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def list_uart_chem_probes() -> dict[str, Any]:
+    """内蔵 mock UART chem probe registry (Akizuki UART 化学 layer 1 SKU) の 一覧を返す。
+    全 probe は hardware_available: False。
+
+    1 probe (STEP 1408 UART CO2 定番、 STEP 1416 I2C 兄弟実装):
+      - mhz19c-co2-uart-e1 (chemistry/co2_uart_ndir、 Winsen MH-Z19C NDIR UART、 Akizuki 116142)
+
+    Returns dict with: ok, probes (list, with akizuki_code + price_jpy + range +
+    uart_baudrate + packet_length_bytes + command_read_co2),
+    probe_count, hardware_available: False, is_mock: True, honest_scope,
+    related_step, excluded_from_v091 (UART variant + Analog 系 = v0.9.2+/v0.10+ candidate 明示),
+    source。
+    """
+    return _uc_list_probes()
+
+
+@server.tool()
+def measure_co2_uart_ndir(
+    probe_id: str,
+    condition_tag: str = "indoor-typical",
+) -> dict[str, Any]:
+    """mock CO2 測定 (MH-Z19C style: NDIR UART 9-byte packet、 CO2 ppm + 内蔵 温度 + packet 合成)。
+    probe_id + condition_tag から deterministic な 2 値 + Winsen 9-byte packet を合成、
+    MH-Z19C datasheet range 内 か verdict を返す。 packet checksum は Winsen 独自 formula
+    (0xFF - sum(byte1..byte7) + 1) で 自己整合 valid。
+
+    ★ v0.1 spike: 実 hardware 送出なし、 全 return dict で is_mock: True + is_packet_synthetic: True。
+    実 MH-Z19C physics (NDIR 4.26μm CO2 吸収線 IR 光量減衰 検出) 模倣なし = skeleton のみ。
+    9-byte packet は byte-identical だが 実測性ゼロ (marker で 機械的判別可能)。
+
+    Args:
+        probe_id: list_uart_chem_probes() の 'probe_id' (現状 'mhz19c-co2-uart-e1' のみ)。
+        condition_tag: 想定 環境 tag (例: 'indoor-typical' / 'crowded-classroom' /
+            'poorly-ventilated' / 'outdoor-fresh')。
+
+    Returns dict with: ok, probe_id, probe_layer, probe_sublayer, part_number,
+    condition_tag, co2_ppm, temperature_c,
+    packet_hex_9byte (space-separated 0xFF 0x86 ... checksum),
+    packet_bytes (list of 9 int), packet_checksum_valid,
+    status_byte (0x86 = normal response) + status_byte_hex,
+    in_range_all, verdict_d8 ('TRUE' or 'NEITHER'), verdict_d8_symbol, verdict_reason,
+    is_mock: True, is_packet_synthetic: True, hardware_available: False,
+    honest_scope, d8_mapping_source, principle, source。
+    """
+    return _uc_measure_co2(probe_id, condition_tag)
 
 
 @server.tool()
@@ -2932,12 +3014,68 @@ def _selftest() -> int:
     print(f"[23f] invalid input rejected: cross_sublayer={not r23f1['ok']}+{not r23f2['ok']}, "
           f"unknown={not r23f3['ok']}+{not r23f4['ok']}")
 
+    # ------------------------------------------------------------------
+    # [24] v0.9.1-alpha: Akizuki UART chemistry layer mock spike (2 MCP tool wire)
+    # ------------------------------------------------------------------
+    #   MCP tool 層で module 実装との 一致 verify (module 側 selftest 7/7 PASS 済)。
+    print("\n--- [24] v0.9.1-alpha: Akizuki UART chemistry layer mock spike (2 MCP tool wire) ---")
+
+    # [24a] list_uart_chem_probes: 1 probe registry
+    r24a = list_uart_chem_probes()
+    assert r24a["ok"] is True
+    assert r24a["probe_count"] == 1
+    assert r24a["hardware_available"] is False
+    assert r24a["is_mock"] is True
+    uc_ids = {p["probe_id"] for p in r24a["probes"]}
+    assert uc_ids == {"mhz19c-co2-uart-e1"}
+    assert "excluded_from_v091" in r24a
+    assert "analog_combustible_needs_safetygate" in r24a["excluded_from_v091"]
+    print(f"[24a] list_uart_chem_probes: count={r24a['probe_count']} hw={r24a['hardware_available']} "
+          f"ids={sorted(uc_ids)}")
+
+    # [24b] measure_co2_uart_ndir: MH-Z19C mock + 9-byte packet
+    r24b = measure_co2_uart_ndir(probe_id="mhz19c-co2-uart-e1", condition_tag="indoor-typical")
+    assert r24b["ok"] is True
+    assert r24b["is_mock"] is True
+    assert r24b["is_packet_synthetic"] is True
+    assert r24b["hardware_available"] is False
+    assert r24b["verdict_d8"] == "TRUE"
+    assert r24b["principle"] == "ndir_ir_absorption"
+    assert len(r24b["packet_bytes"]) == 9
+    assert r24b["packet_bytes"][0] == 0xFF
+    assert r24b["packet_bytes"][1] == 0x86
+    assert r24b["packet_checksum_valid"] is True
+    print(f"[24b] measure_co2_uart_ndir(mhz19c, indoor-typical): co2={r24b['co2_ppm']}ppm "
+          f"packet={r24b['packet_hex_9byte']} verdict={r24b['verdict_d8']}")
+
+    # [24c] measure_co2_uart_ndir: determinism (packet-level)
+    r24c1 = measure_co2_uart_ndir("mhz19c-co2-uart-e1", "crowded-classroom")
+    r24c2 = measure_co2_uart_ndir("mhz19c-co2-uart-e1", "crowded-classroom")
+    assert r24c1["co2_ppm"] == r24c2["co2_ppm"]
+    assert r24c1["packet_bytes"] == r24c2["packet_bytes"]
+    print(f"[24c] measure_co2_uart_ndir determinism: co2+packet equal")
+
+    # [24d] packet CO2 encoding self-consistency (byte[2]<<8 | byte[3] == co2_ppm)
+    r24d = measure_co2_uart_ndir("mhz19c-co2-uart-e1", "poorly-ventilated")
+    packet_co2 = (r24d["packet_bytes"][2] << 8) | r24d["packet_bytes"][3]
+    assert packet_co2 == r24d["co2_ppm"]
+    print(f"[24d] packet encoding self-consistency: packet_high_low={packet_co2} "
+          f"co2_ppm={r24d['co2_ppm']} match=True")
+
+    # [24e] cross-registry misuse rejection (I2C SCD40 not in UART registry) + unknown
+    r24e1 = measure_co2_uart_ndir("scd40-co2-d1", "any")  # I2C SCD40 not in UART registry
+    r24e2 = measure_co2_uart_ndir("unknown-probe", "any")
+    assert not r24e1["ok"] and not r24e2["ok"]
+    print(f"[24e] invalid input rejected: wrong_registry={not r24e1['ok']} "
+          f"unknown={not r24e2['ok']}")
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     print("v0.5.0-alpha SPIKE: import_external_session + SafetyGate + source field 追加 動作確認。")
     print("v0.6.0-alpha: physics-limits pre-flight (Bekenstein/Landauer/Lloyd/op-space/compression) 動作確認。")
     print("v0.7.0-alpha SPIKE: olfact / biosensor mock (list_probes / measure_eag / probe_health) 動作確認。")
     print("v0.8.0-alpha SPIKE: Akizuki wire-up 3 layer mock (env/IMU/ToF) 動作確認。")
     print("v0.9.0-alpha SPIKE: Akizuki chemistry layer mock (SCD40 CO2 / SGP40 VOC) 動作確認。")
+    print("v0.9.1-alpha SPIKE: Akizuki UART chemistry layer mock (MH-Z19C CO2) 動作確認。")
     return 0
 
 
