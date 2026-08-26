@@ -949,7 +949,7 @@ from benchtop_akizuki_wireup import (  # noqa: E402
 )
 
 # v0.9.0-alpha (2026-08-26): Akizuki wire-up chemistry layer mock spike
-# Rei stack STEP 1415 別 tab pickup、 STEP 1408 で recon 済 の 気体センサー 10 SKU
+# Rei stack STEP 1416 別 tab pickup (initially claimed as 1415, renumbered per SAC-4)、 STEP 1408 で recon 済 の 気体センサー 10 SKU
 # から MVP path 2 SKU (SCD40 CO2 光音響 NDIR / SGP40 VOC index 金属酸化物、 I2C 定番)
 # を benchtop mock として 追加。 hardware 未取得 = 全 tool で hardware_available:
 # False marker 徹底、 STEP 1407 akizuki_wireup pattern を そのまま 継承。
@@ -1775,7 +1775,7 @@ def measure_distance(
 # ---------------------------------------------------------------------------
 # v0.9.0-alpha (2026-08-26): Akizuki chemistry layer mock spike (3 tools)
 # ---------------------------------------------------------------------------
-#   Rei stack STEP 1415 別 tab pickup、 STEP 1408 気体センサー 10 SKU recon
+#   Rei stack STEP 1416 別 tab pickup (initially claimed as 1415, renumbered per SAC-4)、 STEP 1408 気体センサー 10 SKU recon
 #   から MVP path 2 SKU (I2C 定番) を benchtop mock として 追加。
 #
 #   3 tool = list_chem_probes / measure_co2_ndir / measure_voc_index

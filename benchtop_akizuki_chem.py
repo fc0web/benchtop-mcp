@@ -3,7 +3,10 @@
 benchtop-mcp Akizuki wire-up chemistry layer : CO2 / VOC mock spike
 ================================================================================
 
-v0.9.0-alpha (2026-08-26, Rei stack STEP 1415 別 tab pickup、 STEP 1407 の
+v0.9.0-alpha (2026-08-26, Rei stack STEP 1416 別 tab pickup [initially claimed as 1415,
+renumbered per SAC-4 collision detect: 別 tab の Tang Nano 9K OSC drift counter spike が
+藤本さん explicit directive で STEP 1415 を 先取済、 hardware evidence stronger claim 尊重で
+我側 renumber = SAC-4 pattern 50 例目]、 STEP 1407 の
 続編 = 化学 layer を STEP 1408 「v0.9-alpha 化学 layer candidate」 明示 の
 MVP path (SCD40 CO2 + SGP40 VOC の I2C 2 SKU) で skeleton 化)。
 
