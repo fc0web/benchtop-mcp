@@ -948,6 +948,17 @@ from benchtop_akizuki_wireup import (  # noqa: E402
     measure_distance as _ak_measure_distance,
 )
 
+# v0.9.0-alpha (2026-08-26): Akizuki wire-up chemistry layer mock spike
+# Rei stack STEP 1415 別 tab pickup、 STEP 1408 で recon 済 の 気体センサー 10 SKU
+# から MVP path 2 SKU (SCD40 CO2 光音響 NDIR / SGP40 VOC index 金属酸化物、 I2C 定番)
+# を benchtop mock として 追加。 hardware 未取得 = 全 tool で hardware_available:
+# False marker 徹底、 STEP 1407 akizuki_wireup pattern を そのまま 継承。
+from benchtop_akizuki_chem import (  # noqa: E402
+    list_chem_probes as _ch_list_probes,
+    measure_co2_ndir as _ch_measure_co2,
+    measure_voc_index as _ch_measure_voc,
+)
+
 AUDIT_DIR = Path(os.environ.get("BENCHTOP_AUDIT_DIR", str(DATA_DIR / "audit")))
 _AUDIT_ENABLED = os.environ.get("BENCHTOP_AUDIT", "1").strip() not in ("0", "false", "no", "")
 _AUDIT: AuditLogWriter | None = None
@@ -982,7 +993,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.8.0-alpha",
+    version="0.9.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -1017,6 +1028,12 @@ server = MCPServer(
         "= 全 tool hardware_available: False、 deterministic mock (probe_id + tag hash seed)、 "
         "実 sensor physics (Bosch calibration / on-chip fusion / SPAD photon counting) は 模倣なし = "
         "interface skeleton のみ。 環境/慣性/距離 3 gap 埋めの STEP 1406 導入 arc。"
+        "v0.9.0-alpha 追加 (SPIKE): Akizuki chemistry layer mock 3 tool — list_chem_probes / "
+        "measure_co2_ndir (SCD40) / measure_voc_index (SGP40)。 STEP 1408 気体センサー 10 SKU recon "
+        "から MVP path 2 SKU (I2C 定番) pilot、 hardware 未取得 = 全 tool hardware_available: False、 "
+        "deterministic mock (probe_id + tag hash seed)、 実 sensor physics (光音響 phonon 共鳴 / SnO2 "
+        "表面吸着) は 模倣なし = interface skeleton のみ。 UART CO2 (MH-Z19C/MH-Z14B) / Analog 系 "
+        "(TGS/MQ/MG812) は v0.10+ candidate (可燃性 MQ 系は SafetyGate 拡張と 同時実装予定)。"
     ),
 )
 
@@ -1753,6 +1770,98 @@ def measure_distance(
     d8_mapping_source, source。
     """
     return _ak_measure_distance(probe_id, target_tag, timing_budget_ms)
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0-alpha (2026-08-26): Akizuki chemistry layer mock spike (3 tools)
+# ---------------------------------------------------------------------------
+#   Rei stack STEP 1415 別 tab pickup、 STEP 1408 気体センサー 10 SKU recon
+#   から MVP path 2 SKU (I2C 定番) を benchtop mock として 追加。
+#
+#   3 tool = list_chem_probes / measure_co2_ndir / measure_voc_index
+#   2 SKU  = ① CO2 (光音響 NDIR) = SCD40 (Akizuki 117851 ¥5,980 I2C)
+#            ② VOC index (金属酸化物) = SGP40 (Akizuki 116444 ¥1,280 I2C)
+#
+#   ★ hardware 未取得 = 全 return dict で hardware_available: False + is_mock: True。
+#   ★ mock 値は deterministic (probe_id + tag hash seed 由来)、 実 sensor physics
+#      (光音響 phonon 共鳴 / SnO2 表面吸着) 模倣なし = interface skeleton のみ
+#      ([[feedback-super-naming-siren-family-pattern]])。
+#   ★ v0.10+ candidate: UART CO2 (MH-Z19C/MH-Z14B) / Analog Odor (TGS 系) /
+#      Analog 可燃性 (MQ-2/3B/4 = SafetyGate 拡張と 同時実装予定) / Analog CO2
+#      (MG812 加熱器 注意)。
+#   ★ STEP 1350 d8_verdict_from_measurement primitive を 2 値 subset で 参照。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def list_chem_probes() -> dict[str, Any]:
+    """内蔵 mock chem probe registry (Akizuki 化学 layer 2 SKU) の 一覧を返す。
+    全 probe は hardware_available: False。
+
+    2 probe (STEP 1408 MVP path、 I2C 定番 の 化学 layer 2 SKU):
+      - scd40-co2-d1 (chemistry/co2_ndir、 SCD40 光音響 NDIR CO2、 Akizuki 117851)
+      - sgp40-voc-d2 (chemistry/voc_index、 SGP40 金属酸化物 VOC index、 Akizuki 116444)
+
+    Returns dict with: ok, probes (list, with akizuki_code + price_jpy + range),
+    probe_count, hardware_available: False, is_mock: True, honest_scope,
+    related_step, excluded_from_v09 (UART/Analog 系 v0.10+ candidate 明示),
+    source。
+    """
+    return _ch_list_probes()
+
+
+@server.tool()
+def measure_co2_ndir(
+    probe_id: str,
+    condition_tag: str = "indoor-typical",
+) -> dict[str, Any]:
+    """mock CO2 測定 (SCD40 style: 光音響 NDIR、 CO2 ppm + temperature + humidity)。
+    probe_id + condition_tag から deterministic な 3 値を生成、 SCD40 datasheet
+    range 内 か verdict を返す。
+
+    ★ v0.1 spike: 実 hardware 送出なし、 全 return dict で is_mock: True。
+    実 SCD40 physics (4.26μm CO2 吸収線 光音響 phonon 共鳴 検出) 模倣なし = skeleton のみ。
+
+    Args:
+        probe_id: list_chem_probes() の 'probe_id' (現状 'scd40-co2-d1' のみ)。
+        condition_tag: 想定 環境 tag (例: 'indoor-typical' / 'crowded-room' /
+            'outdoor-fresh' / 'poorly-ventilated')。
+
+    Returns dict with: ok, probe_id, probe_layer, probe_sublayer, part_number,
+    condition_tag, co2_ppm, temperature_c, humidity_pct, in_range_all,
+    verdict_d8 ('TRUE' or 'NEITHER'), verdict_d8_symbol, verdict_reason,
+    is_mock: True, hardware_available: False, honest_scope,
+    d8_mapping_source, principle, source。
+    """
+    return _ch_measure_co2(probe_id, condition_tag)
+
+
+@server.tool()
+def measure_voc_index(
+    probe_id: str,
+    condition_tag: str = "indoor-nominal",
+) -> dict[str, Any]:
+    """mock VOC index 測定 (SGP40 style: 金属酸化物、 VOC index + raw resistance)。
+    probe_id + condition_tag から deterministic な voc_index (0-500) + raw resistance
+    (log-scale 20kΩ-100MΩ) を生成、 datasheet range 内 か verdict を返す。
+
+    ★ v0.1 spike: 実 hardware 送出なし、 全 return dict で is_mock: True。
+    実 SGP40 physics (SnO2 表面 での VOC 吸着 → 電気抵抗変化 → Sensirion 独自 gas
+    index algorithm) 模倣なし = skeleton のみ。 voc_index_interpretation は
+    Sensirion documentation の 100=nominal 基準 ±10 で 簡略分類。
+
+    Args:
+        probe_id: list_chem_probes() の 'probe_id' (現状 'sgp40-voc-d2' のみ)。
+        condition_tag: 想定 環境 tag (例: 'indoor-nominal' / 'cooking-fumes' /
+            'freshly-painted' / 'alcohol-vapor')。
+
+    Returns dict with: ok, probe_id, probe_layer, probe_sublayer, part_number,
+    condition_tag, voc_index, voc_index_interpretation ('improving'/'nominal'/'degrading'),
+    raw_resistance_ohm, in_range_all, verdict_d8 ('TRUE' or 'NEITHER'),
+    verdict_d8_symbol, verdict_reason, is_mock: True, hardware_available: False,
+    honest_scope, d8_mapping_source, principle, source。
+    """
+    return _ch_measure_voc(probe_id, condition_tag)
 
 
 @server.tool()
@@ -2761,11 +2870,74 @@ def _selftest() -> int:
     print(f"[22f] invalid input rejected: cross_layer=3/3, unknown_probe={not r22f4['ok']}, "
           f"timing_out_of_range={not r22f5['ok']}")
 
+    # ------------------------------------------------------------------
+    # [23] v0.9.0-alpha: Akizuki chemistry layer mock spike (3 MCP tool wire)
+    # ------------------------------------------------------------------
+    #   MCP tool 層で module 実装との 一致 verify (module 側 selftest 9/9 PASS 済)。
+    print("\n--- [23] v0.9.0-alpha: Akizuki chemistry layer mock spike (3 MCP tool wire) ---")
+
+    # [23a] list_chem_probes: 2 probe registry
+    r23a = list_chem_probes()
+    assert r23a["ok"] is True
+    assert r23a["probe_count"] == 2
+    assert r23a["hardware_available"] is False
+    assert r23a["is_mock"] is True
+    ch_ids = {p["probe_id"] for p in r23a["probes"]}
+    assert ch_ids == {"scd40-co2-d1", "sgp40-voc-d2"}
+    assert "excluded_from_v09" in r23a
+    assert "analog_combustible_needs_safetygate" in r23a["excluded_from_v09"]
+    print(f"[23a] list_chem_probes: count={r23a['probe_count']} hw={r23a['hardware_available']} "
+          f"ids={sorted(ch_ids)}")
+
+    # [23b] measure_co2_ndir: SCD40 mock, in-range
+    r23b = measure_co2_ndir(probe_id="scd40-co2-d1", condition_tag="indoor-typical")
+    assert r23b["ok"] is True
+    assert r23b["is_mock"] is True
+    assert r23b["hardware_available"] is False
+    assert r23b["verdict_d8"] == "TRUE"
+    assert r23b["principle"] == "photoacoustic_ndir"
+    print(f"[23b] measure_co2_ndir(scd40, indoor-typical): co2={r23b['co2_ppm']}ppm "
+          f"t={r23b['temperature_c']}C h={r23b['humidity_pct']}% verdict={r23b['verdict_d8']}")
+
+    # [23c] measure_co2_ndir: determinism
+    r23c1 = measure_co2_ndir("scd40-co2-d1", "crowded-room")
+    r23c2 = measure_co2_ndir("scd40-co2-d1", "crowded-room")
+    assert r23c1["co2_ppm"] == r23c2["co2_ppm"]
+    assert r23c1["temperature_c"] == r23c2["temperature_c"]
+    print(f"[23c] measure_co2_ndir determinism: co2+temp equal")
+
+    # [23d] measure_voc_index: SGP40 mock, valid range + interpretation
+    r23d = measure_voc_index(probe_id="sgp40-voc-d2", condition_tag="indoor-nominal")
+    assert r23d["ok"] is True
+    assert r23d["is_mock"] is True
+    assert 0.0 <= r23d["voc_index"] <= 500.0
+    assert r23d["voc_index_interpretation"] in ("improving", "nominal", "degrading")
+    assert r23d["principle"] == "metal_oxide_semiconductor"
+    print(f"[23d] measure_voc_index(sgp40, indoor-nominal): voc={r23d['voc_index']} "
+          f"interp={r23d['voc_index_interpretation']} verdict={r23d['verdict_d8']}")
+
+    # [23e] measure_voc_index: determinism
+    r23e1 = measure_voc_index("sgp40-voc-d2", "cooking-fumes")
+    r23e2 = measure_voc_index("sgp40-voc-d2", "cooking-fumes")
+    assert r23e1["voc_index"] == r23e2["voc_index"]
+    assert r23e1["raw_resistance_ohm"] == r23e2["raw_resistance_ohm"]
+    print(f"[23e] measure_voc_index determinism: voc+raw equal")
+
+    # [23f] cross-sublayer misuse rejection + unknown probe
+    r23f1 = measure_voc_index("scd40-co2-d1", "any")  # SCD40 for VOC
+    r23f2 = measure_co2_ndir("sgp40-voc-d2", "any")   # SGP40 for CO2
+    r23f3 = measure_co2_ndir("unknown-probe", "any")
+    r23f4 = measure_voc_index("unknown-probe", "any")
+    assert all(not r["ok"] for r in (r23f1, r23f2, r23f3, r23f4))
+    print(f"[23f] invalid input rejected: cross_sublayer={not r23f1['ok']}+{not r23f2['ok']}, "
+          f"unknown={not r23f3['ok']}+{not r23f4['ok']}")
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     print("v0.5.0-alpha SPIKE: import_external_session + SafetyGate + source field 追加 動作確認。")
     print("v0.6.0-alpha: physics-limits pre-flight (Bekenstein/Landauer/Lloyd/op-space/compression) 動作確認。")
     print("v0.7.0-alpha SPIKE: olfact / biosensor mock (list_probes / measure_eag / probe_health) 動作確認。")
     print("v0.8.0-alpha SPIKE: Akizuki wire-up 3 layer mock (env/IMU/ToF) 動作確認。")
+    print("v0.9.0-alpha SPIKE: Akizuki chemistry layer mock (SCD40 CO2 / SGP40 VOC) 動作確認。")
     return 0
 
 
