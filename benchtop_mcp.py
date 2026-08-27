@@ -1121,6 +1121,15 @@ from benchtop_olfact import (  # noqa: E402
     probe_health as _ol_probe_health,
 )
 
+# v0.12.0-alpha (2026-08-28): SmellNet replay adapter MCP wire
+# 藤本さん directive 「コネクタ用のツール、装置、端子、マシンで進んでいないものを先に」 応答。
+# v0.11.0-alpha は Python API のみ (measure_eag に replay_source param 追加)、
+# MCP tool として 呼出不可 だった gap を fix。 embedded fixture のみ動作、
+# 実 SmellNet DL は 別 STEP directive 待ち = 継続。
+from benchtop_olfact_smellnet_replay import (  # noqa: E402
+    load_embedded_fixture as _ol_load_embedded_fixture,
+)
+
 # v0.8.0-alpha (2026-08-26): Akizuki wire-up 3 layer mock spike
 # 藤本さん directive 「(1)(2)(3) を 順番に」 実装、 Rei stack STEP 1406 秋月
 # I2C/SPI/UART wire-up 候補 list から 3 SKU pilot (BME280 環境 / BNO055 慣性 /
@@ -1188,7 +1197,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.10.0-alpha",
+    version="0.12.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -1241,6 +1250,15 @@ server = MCPServer(
         "の 補完。 SPIKE ではない (pure calc、 hardware 依存なし、 stdlib のみ)。 v1.0 threshold は "
         "defer 継続 (SPIKE 4 段 = v0.7 olfact / v0.8 wireup / v0.9.0 chem / v0.9.1 uart-chem が "
         "mock skeleton のまま = semver stable 主張は overclaim risk)。 v0.x = MIT irrevocable。"
+        "v0.11.0-alpha (2026-08-27, Python API only): benchtop_olfact.measure_eag() に replay_source "
+        "param 追加、 SmellNet-compatible replay adapter (embedded fixture 3 substance × 3 channel × "
+        "100 timestep) を Python level で 提供、 rei-scout Finding A implementation。 MCP tool wire "
+        "は v0.12 で 完成 (下記)。"
+        "v0.12.0-alpha 追加 (SPIKE): SmellNet replay adapter MCP wire 2 tool — list_smellnet_substances / "
+        "measure_eag_replay。 v0.11 の Python API を MCP client (Claude / rei-aios etc.) から 呼出可能に。 "
+        "embedded fixture のみ動作、 実 SmellNet DL は 別 STEP directive 待ち = 継続。 replay path でも "
+        "hardware_available: False + is_embedded_fixture: True marker 明示、 「mock でない real dataset "
+        "使用」 の 誤読 予防 継続 ([[feedback-super-naming-siren-family-pattern]])。"
     ),
 )
 
@@ -1863,6 +1881,159 @@ def probe_health(
     """
     return _ol_probe_health(
         probe_id, age_hours, last_calibration_hours_ago, calibration_max_interval_hours
+    )
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0-alpha (2026-08-28): SmellNet replay adapter MCP wire (2 tools)
+# ---------------------------------------------------------------------------
+#   藤本さん directive 「コネクタ用のツール、装置、端子、マシンで進んでいないものを先に」
+#   応答。 v0.11.0-alpha の Python-only replay adapter (benchtop_olfact_smellnet_replay)
+#   を MCP tool level で 呼出可能にする。
+#
+#   2 tool:
+#     - list_smellnet_substances : embedded fixture の substance list + metadata
+#     - measure_eag_replay       : replay-based EAG measurement (fixture の 波形を replay)
+#
+#   ★ v0.11 と 同じく embedded fixture のみ 動作、 実 SmellNet DL は 別 STEP directive
+#     待ち = 継続。 全 return dict で hardware_available: False + is_embedded_fixture: True
+#     marker、 「mock でない real dataset 使用」 の 誤読 予防
+#     ([[feedback-super-naming-siren-family-pattern]])。
+#   ★ measure_eag_replay は 内部で load_embedded_fixture() → measure_eag(replay_source=...)
+#     を 呼ぶ = interface 単純化 (client 側 で dict handle passing 不要)。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def list_smellnet_substances() -> dict[str, Any]:
+    """embedded SmellNet-compatible fixture の substance list + metadata を返す。
+    measure_eag_replay で 使える substance 名 を 事前確認する 用。
+
+    v0.11.0-alpha の embedded synthetic fixture (3 substance × 3 channel × 100
+    timestep、 deterministic hashlib.md5 seed 由来 MOX 応答 envelope) の 内容を
+    列挙。 実 SmellNet dataset (HF、 50 substance) は 別 STEP DL 待ち。
+
+    Returns dict with: ok, substances (list[str])、 substance_count, channels (list[str])、
+    channel_count, timestep_count, original_duration_s, data_source: 'embedded_fixture',
+    is_embedded_fixture: True, hardware_available: False, honest_scope, related_step, source。
+    """
+    session = _ol_load_embedded_fixture()
+    if not session.get("ok"):
+        return {
+            "ok": False,
+            "error": f"load_embedded_fixture failed: {session.get('error', 'unknown')}",
+            "hardware_available": False,
+            "source": "benchtop-olfact-smellnet-replay-mcp",
+        }
+    substances = list(session.get("sessions", {}).keys())
+    channels = list(session.get("channels", []))
+    # timestep_count: 各 substance の rows は 同一長 (embedded fixture 生成規約)、
+    # 最初 の substance から 取得
+    first_rows = session["sessions"][substances[0]] if substances else []
+    return {
+        "ok": True,
+        "substances": substances,
+        "substance_count": len(substances),
+        "channels": channels,
+        "channel_count": len(channels),
+        "timestep_count": len(first_rows),
+        "original_duration_s": session.get("original_duration_s"),
+        "data_source": session.get("data_source", "embedded_fixture"),
+        "is_embedded_fixture": True,
+        "hardware_available": False,
+        "honest_scope": (
+            "v0.12.0-alpha spike (MCP wire): embedded fixture のみ列挙、 実 SmellNet "
+            "dataset (HF、 50 substance × 43 mixture × 828K timestep) は 別 STEP "
+            "directive 待ち で 未DL。 embedded fixture の 波形は synthetic MOX 応答 "
+            "envelope (deterministic hashlib.md5 seed 由来)、 実 physics ではない。"
+        ),
+        "related_step": (
+            "STEP 1477 (rei-aios、 SmellNet replay spike v0.11) の MCP wire 完成。 "
+            "rei-scout Finding A (2026-08-27 report) implementation 継続。"
+        ),
+        "source": "benchtop-olfact-smellnet-replay-mcp",
+    }
+
+
+@server.tool()
+def measure_eag_replay(
+    probe_id: str,
+    substance: str,
+    duration_s: float = 3.0,
+    sample_rate_hz: float = 100.0,
+    channel: str | None = None,
+    snr_threshold: float = 3.0,
+) -> dict[str, Any]:
+    """replay-based EAG 測定。 embedded SmellNet-compatible fixture から 指定 substance
+    の 波形を replay + probe_id 側の envelope を 合成、 SNR と D-FUMT₈ verdict を返す。
+
+    v0.11.0-alpha の Python API (`benchtop_olfact.measure_eag(replay_source=...)`)
+    を MCP tool として wire。 client 側で fixture dict を 保持する 必要なく、 substance
+    名 だけで replay 実行可能。
+
+    ★ v0.12 spike scope:
+      - embedded fixture のみ動作、 実 SmellNet CSV load path は 未 wire (v0.13+ candidate)
+      - 全 return dict で is_embedded_fixture: True + data_source: 'replay-embedded' marker
+      - hardware_available: False 継続、 「replay = real hardware」 の 誤読 予防
+
+    Args:
+        probe_id: list_probes() の 'probe_id' field (silkworm-antenna-a1 等)。
+        substance: list_smellnet_substances() の 'substances' field (ethanol / acetone /
+                  hexanol)。 substance が fixture に無ければ error return。
+        duration_s: 測定継続時間 (秒)、 default 3.0、 must be > 0。
+                  fixture の original_duration_s より 長い場合は wrap around で 対応。
+        sample_rate_hz: サンプリング周波数 (Hz)、 default 100.0、 must be > 0。
+        channel: replay 抽出 channel 名 (None なら fixture の 最初 の channel 使用)。
+        snr_threshold: D-FUMT₈ verdict 境界 (default 3.0、 STEP 1350 primitive と同)。
+
+    Returns dict with: ok, probe_id, probe_layer, substance, odor_name (= substance),
+    duration_s, sample_rate_hz, sample_count, waveform_mv, peak_mv, amp_estimated_mv,
+    noise_floor_mv, snr_ratio, snr_threshold, verdict_d8, verdict_d8_symbol,
+    verdict_reason, data_source: 'replay-embedded', is_embedded_fixture: True,
+    is_mock: False (replay path)、 hardware_available: False, honest_scope,
+    d8_mapping_source, source。
+    """
+    if duration_s <= 0:
+        return {
+            "ok": False,
+            "error": "duration_s must be > 0",
+            "hardware_available": False,
+            "source": "benchtop-olfact-smellnet-replay-mcp",
+        }
+    if sample_rate_hz <= 0:
+        return {
+            "ok": False,
+            "error": "sample_rate_hz must be > 0",
+            "hardware_available": False,
+            "source": "benchtop-olfact-smellnet-replay-mcp",
+        }
+    session = _ol_load_embedded_fixture()
+    if not session.get("ok"):
+        return {
+            "ok": False,
+            "error": f"load_embedded_fixture failed: {session.get('error', 'unknown')}",
+            "hardware_available": False,
+            "source": "benchtop-olfact-smellnet-replay-mcp",
+        }
+    substances = list(session.get("sessions", {}).keys())
+    if substance not in substances:
+        return {
+            "ok": False,
+            "error": f"substance {substance!r} not in embedded fixture",
+            "available_substances": substances,
+            "hardware_available": False,
+            "source": "benchtop-olfact-smellnet-replay-mcp",
+        }
+    replay_source_kwargs: dict[str, Any] = {"replay_source": session, "replay_substance": substance}
+    if channel is not None:
+        replay_source_kwargs["replay_channel"] = channel
+    return _ol_measure_eag(
+        probe_id,
+        substance,
+        duration_s,
+        sample_rate_hz,
+        snr_threshold,
+        **replay_source_kwargs,
     )
 
 
@@ -3440,6 +3611,90 @@ def _selftest() -> int:
     print("v0.9.0-alpha SPIKE: Akizuki chemistry layer mock (SCD40 CO2 / SGP40 VOC) 動作確認。")
     print("v0.9.1-alpha SPIKE: Akizuki UART chemistry layer mock (MH-Z19C CO2) 動作確認。")
     print("v0.10.0-alpha: declarative alert rule engine (check_alert_rules) 動作確認。 v1.0 は defer 継続。")
+
+    # -----------------------------------------------------------------------
+    # [26] v0.12.0-alpha: SmellNet replay adapter MCP wire (2 tool)
+    # 藤本さん 2026-08-28 directive 「コネクタ用のツール、装置、端子、マシンで進んで
+    # いないものを先に」 応答、 v0.11 の Python API を MCP tool として wire。
+    # -----------------------------------------------------------------------
+    print("\n--- [26] v0.12.0-alpha: SmellNet replay adapter MCP wire (2 tool) ---")
+
+    # [26a] list_smellnet_substances: 3 substance × 3 channel × 100 timestep fixture
+    r26a = list_smellnet_substances()
+    assert r26a["ok"] is True, f"[26a] failed: {r26a}"
+    assert r26a["substance_count"] == 3, f"[26a] substance_count expected 3, got {r26a['substance_count']}"
+    assert set(r26a["substances"]) == {"ethanol", "acetone", "hexanol"}, f"[26a] substances mismatch: {r26a['substances']}"
+    assert r26a["channel_count"] == 3
+    assert r26a["timestep_count"] == 100
+    assert r26a["is_embedded_fixture"] is True
+    assert r26a["hardware_available"] is False
+    assert "STEP 1477" in r26a["related_step"]
+    print(f"[26a] list_smellnet_substances: substances={r26a['substances']} "
+          f"channels={r26a['channel_count']} timesteps={r26a['timestep_count']}")
+
+    # [26b] measure_eag_replay: valid replay path (ethanol, silkworm probe, 2s @ 100Hz)
+    r26b = measure_eag_replay(
+        probe_id="silkworm-antenna-a1",
+        substance="ethanol",
+        duration_s=2.0,
+        sample_rate_hz=100.0,
+    )
+    assert r26b["ok"] is True, f"[26b] failed: {r26b}"
+    assert r26b["data_source"] == "replay", f"[26b] data_source expected 'replay', got {r26b.get('data_source')}"
+    assert r26b["is_embedded_fixture"] is True
+    assert r26b["hardware_available"] is False
+    assert r26b["sample_count"] == 200
+    assert len(r26b["waveform_mv"]) == 200
+    assert r26b["verdict_d8"] in ("TRUE", "NEITHER", "FALSE")
+    print(f"[26b] measure_eag_replay(silkworm, ethanol, 2s@100Hz): "
+          f"snr={r26b['snr_ratio']:.2f} verdict={r26b['verdict_d8']} "
+          f"data_source={r26b['data_source']} is_fixture={r26b['is_embedded_fixture']}")
+
+    # [26c] measure_eag_replay: determinism (same input → same waveform)
+    r26c1 = measure_eag_replay("mosquito-receptor-fet-b1", "acetone", 1.0, 100.0)
+    r26c2 = measure_eag_replay("mosquito-receptor-fet-b1", "acetone", 1.0, 100.0)
+    assert r26c1["waveform_mv"] == r26c2["waveform_mv"], "[26c] replay path not deterministic"
+    assert r26c1["snr_ratio"] == r26c2["snr_ratio"]
+    print(f"[26c] measure_eag_replay determinism: waveform_equal=True snr={r26c1['snr_ratio']:.2f}")
+
+    # [26d] measure_eag_replay: mock path vs replay path 区別可能
+    r26d_mock = measure_eag("silkworm-antenna-a1", "ethanol", 1.0, 100.0)
+    r26d_replay = measure_eag_replay("silkworm-antenna-a1", "ethanol", 1.0, 100.0)
+    assert r26d_mock.get("data_source", "mock") != r26d_replay["data_source"], \
+        f"[26d] mock vs replay data_source not distinguishable: mock={r26d_mock.get('data_source')} replay={r26d_replay['data_source']}"
+    assert r26d_mock["waveform_mv"] != r26d_replay["waveform_mv"], "[26d] mock and replay waveforms identical (unexpected)"
+    print(f"[26d] mock vs replay distinguishable: "
+          f"mock.data_source={r26d_mock.get('data_source', 'mock')} vs replay.data_source={r26d_replay['data_source']}")
+
+    # [26e] measure_eag_replay: input validation (duration_s<=0, sample_rate_hz<=0, unknown substance/probe)
+    r26e1 = measure_eag_replay("silkworm-antenna-a1", "ethanol", -1.0, 100.0)
+    r26e2 = measure_eag_replay("silkworm-antenna-a1", "ethanol", 1.0, 0.0)
+    r26e3 = measure_eag_replay("silkworm-antenna-a1", "unknown-substance", 1.0, 100.0)
+    r26e4 = measure_eag_replay("unknown-probe", "ethanol", 1.0, 100.0)
+    assert not r26e1["ok"] and "duration_s" in r26e1["error"]
+    assert not r26e2["ok"] and "sample_rate_hz" in r26e2["error"]
+    assert not r26e3["ok"] and "unknown-substance" in r26e3["error"] and "available_substances" in r26e3
+    assert not r26e4["ok"]
+    print(f"[26e] invalid input rejected: duration={not r26e1['ok']} sample_rate={not r26e2['ok']} "
+          f"unknown_substance={not r26e3['ok']} unknown_probe={not r26e4['ok']}")
+
+    # [26f] channel selection: explicit channel vs default (both should work)
+    # 実際の channel 名 は list_smellnet_substances() で 取得可能 (ch1_resistance_kohm etc.)
+    channel_2 = r26a["channels"][1] if len(r26a["channels"]) >= 2 else r26a["channels"][0]
+    r26f_default = measure_eag_replay("sparse-e-nose-c1", "hexanol", 1.0, 100.0)
+    r26f_ch2 = measure_eag_replay("sparse-e-nose-c1", "hexanol", 1.0, 100.0, channel=channel_2)
+    assert r26f_default["ok"], f"[26f] default failed: {r26f_default}"
+    assert r26f_ch2["ok"], f"[26f] ch2 failed: {r26f_ch2}"
+    # Different channels → different waveforms
+    assert r26f_default["waveform_mv"] != r26f_ch2["waveform_mv"], "[26f] default and 2nd channels produce same waveform (unexpected)"
+    print(f"[26f] channel selection: default_ch and {channel_2!r} both work, produce different waveforms")
+
+    # [26g] invalid channel rejected
+    r26g = measure_eag_replay("silkworm-antenna-a1", "ethanol", 1.0, 100.0, channel="nonexistent-channel")
+    assert not r26g["ok"], f"[26g] invalid channel should fail: {r26g}"
+    print(f"[26g] invalid channel rejected: ok={r26g['ok']}")
+
+    print("v0.12.0-alpha SPIKE: SmellNet replay adapter MCP wire (list_smellnet_substances / measure_eag_replay) 動作確認。")
     return 0
 
 
