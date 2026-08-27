@@ -235,23 +235,36 @@ def measure_eag(
     duration_s: float = 3.0,
     sample_rate_hz: float = 100.0,
     snr_threshold: float = 3.0,
+    replay_source: dict[str, Any] | None = None,
+    replay_substance: str | None = None,
+    replay_channel: str | None = None,
 ) -> dict[str, Any]:
-    """mock EAG 測定。 probe_id + odor_name から deterministic 波形を生成、 SNR と
-    D-FUMT₈ verdict (STEP 1350 mapping subset) を返す。
+    """EAG 測定。 replay_source を 与えない 場合 は v0.7 通り deterministic mock、
+    replay_source を 与えた 場合 は v0.11 で 追加された SmellNet 互換 replay adapter
+    経由 の real dataset waveform (fixture or external CSV) を 返す。
 
     Args:
         probe_id: list_probes() の 'probe_id' field (silkworm-antenna-a1 等)。
-        odor_name: 提示する 匂い名 (mock、 実 stimulus 装置 制御なし)。
+        odor_name: 提示する 匂い名 (mock path、 実 stimulus 装置 制御なし)。
+            replay path では replay_substance が 優先。
         duration_s: 測定継続時間 (秒)、 must be > 0。
         sample_rate_hz: サンプリング周波数 (Hz)、 must be > 0。
         snr_threshold: D-FUMT₈ verdict の TRUE / NEITHER 境界 (default 3.0、
             STEP 1350 primitive と 同 default)。
+        replay_source: benchtop_olfact_smellnet_replay.load_smellnet_csv() or
+            load_embedded_fixture() の 返り値 (ok=True の session dict)。 None なら
+            v0.7 mock path、 dict なら replay path で SmellNet-compatible waveform を
+            使用 (v0.11.0-alpha 追加、 STEP 1477 spike)。
+        replay_substance: replay path で 使用する substance 名 (None なら odor_name
+            を そのまま 使用)。 replay_source の sessions に 存在する 必要あり。
+        replay_channel: replay path で 使用する channel 名 (None なら 最初の channel)。
 
     Returns dict with:
         ok, probe_id, odor_name, duration_s, sample_rate_hz, sample_count,
         waveform_mv (list[float]), peak_mv, amp_estimated_mv, noise_floor_mv,
         snr_ratio, snr_threshold, verdict_d8, verdict_d8_symbol,
-        is_mock: True, hardware_available: False, honest_scope, source。
+        data_source ('mock' | 'replay' — v0.11 追加), is_mock (mock path のみ True),
+        hardware_available: False, honest_scope, source。
     """
     if probe_id not in _MOCK_PROBES:
         return {
@@ -267,6 +280,90 @@ def measure_eag(
     if snr_threshold <= 0:
         return {"ok": False, "error": "snr_threshold must be > 0", "source": "benchtop-olfact-measure"}
 
+    # ------------------------------------------------------------------
+    # v0.11.0-alpha 追加: replay path
+    # ------------------------------------------------------------------
+    if replay_source is not None:
+        # local import で 循環参照 回避 + optional module 化
+        from benchtop_olfact_smellnet_replay import get_replay_window
+        substance = replay_substance if replay_substance is not None else odor_name
+        replay_result = get_replay_window(
+            replay_source, substance, duration_s, sample_rate_hz, channel=replay_channel
+        )
+        if not replay_result.get("ok"):
+            return {
+                "ok": False,
+                "error": f"replay_source get_replay_window failed: {replay_result.get('error')}",
+                "replay_diagnostics": replay_result,
+                "source": "benchtop-olfact-measure",
+            }
+        # replay waveform は arbitrary units (fixture は kΩ)、 mV 換算せず raw waveform
+        # を そのまま return + peak / SNR は observed data から 計算 (mock の amp/noise
+        # とは 別 semantics = data_source 明示 で 区別可能)。
+        waveform = replay_result["waveform"]
+        peak = replay_result["peak"]
+        mean = replay_result["mean"]
+        min_v = replay_result["min"]
+        max_v = replay_result["max"]
+        # SNR proxy: (max - min) / (stdev around mean)、 stdev は 簡易計算
+        if len(waveform) > 1:
+            var = sum((x - mean) ** 2 for x in waveform) / len(waveform)
+            stdev = math.sqrt(var)
+        else:
+            stdev = 0.0
+        signal_range = max_v - min_v
+        snr = signal_range / stdev if stdev > 0 else float("inf")
+        if snr >= snr_threshold:
+            verdict = "TRUE"
+            symbol = "⊤"
+            reason = "replay_signal_range_above_noise"
+        else:
+            verdict = "NEITHER"
+            symbol = "〜"
+            reason = "replay_snr_below_threshold"
+        return {
+            "ok": True,
+            "probe_id": probe_id,
+            "probe_layer": _MOCK_PROBES[probe_id]["layer"],
+            "odor_name": odor_name,
+            "replay_substance": substance,
+            "replay_channel": replay_result["channel"],
+            "duration_s": duration_s,
+            "sample_rate_hz": sample_rate_hz,
+            "sample_count": len(waveform),
+            "waveform_mv": waveform,  # 名前は互換維持、 実 units は data_source 参照
+            "waveform_units": "channel-native (fixture: kΩ, external CSV: source-dependent)",
+            "peak_mv": peak,
+            "waveform_min": min_v,
+            "waveform_max": max_v,
+            "waveform_mean": mean,
+            "waveform_stdev": stdev,
+            "amp_estimated_mv": signal_range,  # replay: signal range as amplitude proxy
+            "noise_floor_mv": stdev,  # replay: stdev as noise proxy
+            "snr_ratio": snr,
+            "snr_threshold": snr_threshold,
+            "verdict_d8": verdict,
+            "verdict_d8_symbol": symbol,
+            "verdict_reason": reason,
+            "data_source": "replay",
+            "is_mock": False,
+            "is_embedded_fixture": replay_source.get("is_embedded_fixture", False),
+            "replay_wrap_around": replay_result.get("wrap_around", False),
+            "hardware_available": False,
+            "honest_scope": (
+                "v0.11.0-alpha replay path: SmellNet-compatible session から waveform "
+                "抽出 (fixture: synthetic MOX 応答 envelope, external CSV: source-dependent)。 "
+                "実 hardware 測定 ではない = data_source='replay' + is_mock=False marker で "
+                "mock path と 区別可能。 replay_source が embedded fixture なら "
+                "is_embedded_fixture=True (実 SmellNet DL は 別 STEP)。"
+            ),
+            "d8_mapping_source": "STEP 1350 d8_verdict_from_measurement (3-value subset)",
+            "source": "benchtop-olfact-measure",
+        }
+
+    # ------------------------------------------------------------------
+    # v0.7 mock path (unchanged behavior for backward compat)
+    # ------------------------------------------------------------------
     waveform, peak_mv, amp_mv, noise_mv = _mock_eag_waveform(
         probe_id, odor_name, duration_s, sample_rate_hz
     )
@@ -297,12 +394,14 @@ def measure_eag(
         "verdict_d8": verdict,
         "verdict_d8_symbol": symbol,
         "verdict_reason": reason,
+        "data_source": "mock",
         "is_mock": True,
         "hardware_available": False,
         "honest_scope": (
-            "v0.7.0-alpha spike: deterministic mock waveform (probe_id + odor_name "
+            "v0.7.0-alpha mock path: deterministic mock waveform (probe_id + odor_name "
             "hash seed 由来)、 実 EAG physics (ion channel kinetics 等) を模倣して "
-            "いない = interface skeleton のみ。 実 hardware 統合は 別 STEP candidate。"
+            "いない = interface skeleton のみ。 実 hardware 統合は 別 STEP candidate。 "
+            "v0.11.0-alpha 追加 replay_source param で SmellNet-compatible replay 可能。"
         ),
         "d8_mapping_source": "STEP 1350 d8_verdict_from_measurement (3-value subset)",
         "source": "benchtop-olfact-measure",
@@ -550,6 +649,71 @@ def _selftest() -> int:
     check(r2["source"] == "benchtop-olfact-measure", "measure_eag source")
     check(r7["source"] == "benchtop-olfact-health", "probe_health source")
     print(f"[14] source markers: 3/3 present")
+
+    # ==================================================================
+    # v0.11.0-alpha 追加: replay path integration tests
+    # ==================================================================
+    from benchtop_olfact_smellnet_replay import load_embedded_fixture
+
+    # [15] mock path returns data_source='mock'
+    r15 = measure_eag("silkworm-antenna-a1", "ethanol", 3.0, 100.0)
+    check(r15["data_source"] == "mock", f"mock path data_source='mock' (got {r15['data_source']})")
+    check(r15["is_mock"] is True, "mock path is_mock=True")
+    print(f"[15] mock path marker: data_source={r15['data_source']} is_mock={r15['is_mock']}")
+
+    # [16] replay path with embedded fixture
+    fixture = load_embedded_fixture()
+    r16 = measure_eag(
+        "silkworm-antenna-a1", "ethanol", 5.0, 20.0,
+        replay_source=fixture,
+    )
+    check(r16["ok"] is True, "replay measure_eag ok")
+    check(r16["data_source"] == "replay", f"replay data_source='replay' (got {r16['data_source']})")
+    check(r16["is_mock"] is False, "replay is_mock=False")
+    check(r16["is_embedded_fixture"] is True, "replay is_embedded_fixture=True (fixture)")
+    check(r16["replay_substance"] == "ethanol", "replay_substance default from odor_name")
+    check(r16["replay_channel"] == "ch1_resistance_kohm", "replay_channel default = ch1")
+    check(r16["sample_count"] == 100, f"5s * 20Hz = 100 samples (got {r16['sample_count']})")
+    check(r16["waveform_units"] == "channel-native (fixture: kΩ, external CSV: source-dependent)",
+          "replay waveform_units label")
+    print(f"[16] replay ethanol: samples={r16['sample_count']} peak={r16['peak_mv']:.2f} "
+          f"verdict={r16['verdict_d8']}/{r16['verdict_d8_symbol']}")
+
+    # [17] replay with explicit substance override
+    r17 = measure_eag(
+        "silkworm-antenna-a1", "user-facing-odor-label", 2.0, 10.0,
+        replay_source=fixture,
+        replay_substance="acetone",
+        replay_channel="ch2_resistance_kohm",
+    )
+    check(r17["ok"] is True, "explicit substance ok")
+    check(r17["replay_substance"] == "acetone", "explicit substance override")
+    check(r17["replay_channel"] == "ch2_resistance_kohm", "explicit channel override")
+    check(r17["odor_name"] == "user-facing-odor-label", "odor_name passthrough (independent of replay)")
+    print(f"[17] replay override: odor={r17['odor_name']} substance={r17['replay_substance']} "
+          f"channel={r17['replay_channel']}")
+
+    # [18] replay with unknown substance rejection
+    r18 = measure_eag(
+        "silkworm-antenna-a1", "unknown-odor", 1.0, 10.0,
+        replay_source=fixture,
+    )
+    check(r18["ok"] is False, "replay unknown substance rejected")
+    check("replay_diagnostics" in r18, "replay diagnostics attached on failure")
+    check("available_substances" in r18["replay_diagnostics"], "diagnostics list substances")
+    print(f"[18] replay unknown substance rejected: available={r18['replay_diagnostics']['available_substances']}")
+
+    # [19] replay determinism (same fixture, same query → same waveform)
+    r19a = measure_eag("silkworm-antenna-a1", "hexanol", 3.0, 20.0, replay_source=fixture)
+    r19b = measure_eag("silkworm-antenna-a1", "hexanol", 3.0, 20.0, replay_source=fixture)
+    check(r19a["waveform_mv"] == r19b["waveform_mv"], "replay determinism")
+    print(f"[19] replay determinism: waveform equal={r19a['waveform_mv'] == r19b['waveform_mv']}")
+
+    # [20] replay path SNR computation is different semantics (signal_range/stdev)
+    #      vs mock (amp/noise_floor)、 but 双方 snr_ratio field で 統一 verdict
+    check("snr_ratio" in r16 and r16["snr_ratio"] > 0, "replay snr_ratio present + positive")
+    check(r16["verdict_d8"] in ("TRUE", "NEITHER"), "replay verdict in TRUE/NEITHER")
+    print(f"[20] replay SNR semantics: snr={r16['snr_ratio']:.2f} verdict={r16['verdict_d8']}")
 
     print(f"\n=== selftest result: {passed} passed, {failed} failed ===")
     return 0 if failed == 0 else 1
