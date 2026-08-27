@@ -815,6 +815,191 @@ class Bench:
             }
         return result
 
+    # -- v0.10.0-alpha 追加: 宣言的アラートルール ------------------------------
+
+    _ALERT_ROW_OPS = ("gt", "lt", "abs_gt", "sigma")
+    _ALERT_SESSION_OPS = ("drift_abs", "stdev_gt", "mean_abs_gt")
+    _ALERT_SEVERITY = ("info", "warn", "critical")
+
+    @staticmethod
+    def check_alerts(session: Session, rules: list[dict[str, Any]]) -> dict[str, Any]:
+        """既存 session に対して 宣言的 alert rule 群を 適用し、 マッチした
+        rule と 該当 row を 一覧化する (v0.10.0-alpha)。
+
+        `analyze_session` の 3σ 外れ値検出は 固定則 (3σ、 session mean/stdev 基準)
+        だが、 実運用では 「T が 30 度超えたら」 「drift が 0.5 mV 超えたら」
+        「stdev が 0.1 mV 超えたら」 のような 校正・保守基準の 閾値を session
+        ごとに 適用したい。 その rule engine。
+
+        Rule schema (1 entry):
+          - `channel` (str, required): 対象チャンネル名
+          - `op` (str, required): 演算子。以下のいずれか
+              # per-row (matched row を index 付きで 返す):
+              - "gt" : value > threshold
+              - "lt" : value < threshold
+              - "abs_gt" : abs(value) > threshold
+              - "sigma" : abs(value - session_mean) / session_stdev > threshold
+              # session-level (集約統計を 1 回評価):
+              - "drift_abs" : abs(last - first) > threshold
+              - "stdev_gt" : session_stdev > threshold
+              - "mean_abs_gt" : abs(session_mean) > threshold
+          - `threshold` (float, required): 閾値
+          - `severity` (str, optional): "info" / "warn" / "critical" (既定 "warn"、
+                                         invalid は "warn" に fallback)
+          - `label` (str, optional): human-readable 名 (audit 用)
+
+        Guard:
+          - channel が session に無い → skip_reason: "channel_not_found"
+          - op が sigma で stdev==0 → "zero_variance"
+          - op が sigma / stdev_gt で n<2 → "insufficient_samples"
+          - op が未知 → "unknown_op"
+          - required field 欠落 → "missing_required_field"
+
+        matched_rows は 最大 100 まで (hoard 防止、 match_count は実件数)。
+        判定は呼び出し側の責任: `severity` は目安、 実 escalation は caller が決める。
+        """
+        alerts: list[dict[str, Any]] = []
+        skipped = 0
+        any_matched = False
+        crit_count = 0
+        warn_count = 0
+        info_count = 0
+
+        stats = Bench.analyze(session)["channels"]
+
+        for rule in rules:
+            ch = rule.get("channel")
+            op = rule.get("op")
+            threshold = rule.get("threshold")
+            severity = rule.get("severity", "warn")
+            if severity not in Bench._ALERT_SEVERITY:
+                severity = "warn"
+            label = rule.get("label")
+
+            alert_entry: dict[str, Any] = {
+                "rule": rule,
+                "matched": False,
+                "level": None,
+                "matched_rows": [],
+                "match_count": 0,
+                "severity": severity,
+                "label": label,
+                "skip_reason": None,
+            }
+
+            if ch is None or op is None or threshold is None:
+                alert_entry["skip_reason"] = "missing_required_field"
+                skipped += 1
+                alerts.append(alert_entry)
+                continue
+
+            if ch not in session.channels:
+                alert_entry["skip_reason"] = "channel_not_found"
+                skipped += 1
+                alerts.append(alert_entry)
+                continue
+
+            ch_stats = stats.get(ch)
+            if ch_stats is None or ch_stats["n"] == 0:
+                alert_entry["skip_reason"] = "channel_empty"
+                skipped += 1
+                alerts.append(alert_entry)
+                continue
+
+            if op in Bench._ALERT_ROW_OPS:
+                alert_entry["level"] = "row"
+                if op == "sigma":
+                    if ch_stats["n"] < 2:
+                        alert_entry["skip_reason"] = "insufficient_samples"
+                        skipped += 1
+                        alerts.append(alert_entry)
+                        continue
+                    if ch_stats["stdev"] <= 0:
+                        alert_entry["skip_reason"] = "zero_variance"
+                        skipped += 1
+                        alerts.append(alert_entry)
+                        continue
+
+                mean = ch_stats["mean"]
+                sd = ch_stats["stdev"]
+                matches: list[dict[str, Any]] = []
+                for i, r in enumerate(session.rows):
+                    if ch not in r:
+                        continue
+                    v = r[ch]
+                    ok = False
+                    if op == "gt":
+                        ok = v > threshold
+                    elif op == "lt":
+                        ok = v < threshold
+                    elif op == "abs_gt":
+                        ok = abs(v) > threshold
+                    elif op == "sigma":
+                        ok = abs(v - mean) / sd > threshold
+                    if ok:
+                        matches.append({"index": i, "value": round(v, 6)})
+                alert_entry["match_count"] = len(matches)
+                alert_entry["matched_rows"] = matches[:100]
+                alert_entry["matched"] = len(matches) > 0
+
+            elif op in Bench._ALERT_SESSION_OPS:
+                alert_entry["level"] = "session"
+                if op == "stdev_gt" and ch_stats["n"] < 2:
+                    alert_entry["skip_reason"] = "insufficient_samples"
+                    skipped += 1
+                    alerts.append(alert_entry)
+                    continue
+
+                if op == "drift_abs":
+                    val = abs(ch_stats["drift"])
+                elif op == "stdev_gt":
+                    val = ch_stats["stdev"]
+                else:  # mean_abs_gt
+                    val = abs(ch_stats["mean"])
+                if val > threshold:
+                    alert_entry["matched"] = True
+                    alert_entry["match_count"] = 1
+                alert_entry["session_value"] = round(val, 6)
+
+            else:
+                alert_entry["skip_reason"] = "unknown_op"
+                skipped += 1
+                alerts.append(alert_entry)
+                continue
+
+            if alert_entry["matched"]:
+                any_matched = True
+                if severity == "critical":
+                    crit_count += 1
+                elif severity == "warn":
+                    warn_count += 1
+                else:
+                    info_count += 1
+            alerts.append(alert_entry)
+
+        return {
+            "session_id": session.id,
+            "started_at": session.started_at,
+            "started_at_local": _to_local_iso(session.started_at),
+            "n_rules": len(rules),
+            "n_rules_skipped": skipped,
+            "alerts": alerts,
+            "any_matched": any_matched,
+            "critical_count": crit_count,
+            "warn_count": warn_count,
+            "info_count": info_count,
+            "supported_ops": {
+                "row_level": list(Bench._ALERT_ROW_OPS),
+                "session_level": list(Bench._ALERT_SESSION_OPS),
+            },
+            "notes": (
+                "matched_rows は最大 100 rows (match_count は実件数)。 "
+                "sigma op は session 内 z-score (analyze の 3σ と 同じ計算軸だが k は user 指定)。 "
+                "gate 未評価 (channel 不在 / stdev=0 等) は skip_reason に理由、 matched は False。 "
+                "severity は 目安、 実 escalation 判定は caller の責任。"
+            ),
+        }
+
     @staticmethod
     def search_sessions(
         since: str | None = None,
@@ -1003,7 +1188,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.9.1-alpha",
+    version="0.10.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -1050,6 +1235,12 @@ server = MCPServer(
         "with Winsen checksum formula) を pilot、 hardware 未取得 = hardware_available:False + "
         "is_packet_synthetic:True marker、 実 UART serial + IR 光量減衰 検出 は 模倣なし = interface "
         "skeleton のみ。 9-byte packet は seed から 決定的合成 (byte-identical だが 実測性ゼロ)。"
+        "v0.10.0-alpha 追加: 宣言的 alert rule engine 1 tool — check_alert_rules。 既存 session に "
+        "対して user 定義の 閾値ルール (gt/lt/abs_gt/sigma per-row + drift_abs/stdev_gt/mean_abs_gt "
+        "session-level) を 適用、 校正・保守基準の 静的 gate として使う。 analyze_session の 3σ 固定則 "
+        "の 補完。 SPIKE ではない (pure calc、 hardware 依存なし、 stdlib のみ)。 v1.0 threshold は "
+        "defer 継続 (SPIKE 4 段 = v0.7 olfact / v0.8 wireup / v0.9.0 chem / v0.9.1 uart-chem が "
+        "mock skeleton のまま = semver stable 主張は overclaim risk)。 v0.x = MIT irrevocable。"
     ),
 )
 
@@ -2103,6 +2294,83 @@ def compare_sessions(
 
 
 @server.tool()
+def check_alert_rules(
+    rules: list[dict[str, Any]],
+    sid: str = "",
+    session_id: str = "",
+) -> dict[str, Any]:
+    """既存 session に 宣言的 alert rule 群を 適用する (v0.10.0-alpha)。
+
+    `analyze_session` の 3σ 外れ値検出は 固定則 (3σ + session mean/stdev 基準)
+    だが、 実運用では 「T が 30 度超えたら」 「drift が 0.5 mV 超えたら」
+    「stdev が 0.1 mV 超えたら」 のような 校正・保守基準の 閾値を session
+    ごとに 適用したい。 その declarative rule engine。
+
+    Rule schema (1 entry):
+      - `channel` (str, required): 対象チャンネル名 (analyze で 出てくる ch 名)
+      - `op` (str, required): 演算子
+          # per-row (matched row を index 付きで 返す):
+          "gt" | "lt" | "abs_gt" | "sigma"
+          # session-level (集約統計を 1 回評価):
+          "drift_abs" | "stdev_gt" | "mean_abs_gt"
+      - `threshold` (float, required): 閾値
+      - `severity` (str, optional): "info" | "warn" | "critical" (既定 "warn"、
+                                     invalid は "warn" に fallback)
+      - `label` (str, optional): human-readable 名 (audit 用)
+
+    Return:
+      - `alerts[]` 各 entry は matched (bool) / match_count / matched_rows
+        (最大 100) / severity / label / skip_reason / session_value (session-level)
+      - top-level: any_matched / critical_count / warn_count / info_count /
+        n_rules / n_rules_skipped / supported_ops
+
+    Guard:
+      - channel が session に無い → `skip_reason: "channel_not_found"`
+      - sigma op で stdev==0 → `"zero_variance"`
+      - sigma / stdev_gt で n<2 → `"insufficient_samples"`
+      - unknown op → `"unknown_op"`
+      - required field 欠落 → `"missing_required_field"`
+      - どの guard も matched は False (skip_reason で 理由が読める)
+
+    存在しない session_id は structured error dict を返す (例外は投げない)。
+
+    Args:
+        rules: alert rule dict の list。 各 rule は 上記 schema。 空 list は 0 alert。
+        sid: 対象セッション ID (別名 `session_id` も可、 remote-devices MCP proxy
+             回避のため sid を推奨、 v0.4.0 arg name discipline 継承)。
+
+    設計上の非目標 (non-goal):
+      - 連続 stream への push 通知 (この tool は 既存 session への 静的評価のみ)
+      - t 検定 / 分布仮定 (fixed-threshold gate)
+      - baseline session との 比較 (compare_sessions の 領域、 別 tool)
+    """
+    _sid = _resolve_sid(sid, session_id)
+    if isinstance(_sid, dict):
+        return _sid
+    session_id = _sid
+    if not isinstance(rules, list):
+        return {
+            "error": "invalid_rules",
+            "hint": "rules must be a list of rule dicts (see docstring for schema)",
+        }
+    s = _load_session_or_error(session_id)
+    if isinstance(s, dict):
+        _write_audit(action="check_alert_rules", target=session_id, result="error",
+                     detail={"error": s.get("error"), "n_rules": len(rules)})
+        return s
+    result = Bench.check_alerts(s, rules)
+    _write_audit(action="check_alert_rules", target=session_id, result="success",
+                 detail={
+                     "n_rules": result["n_rules"],
+                     "n_rules_skipped": result["n_rules_skipped"],
+                     "any_matched": result["any_matched"],
+                     "critical_count": result["critical_count"],
+                     "warn_count": result["warn_count"],
+                 })
+    return result
+
+
+@server.tool()
 def search_sessions(
     since: str | None = None,
     until: str | None = None,
@@ -3069,6 +3337,101 @@ def _selftest() -> int:
     print(f"[24e] invalid input rejected: wrong_registry={not r24e1['ok']} "
           f"unknown={not r24e2['ok']}")
 
+    # ------------------------------------------------------------------
+    # [25] v0.10.0-alpha: 宣言的 alert rule engine (check_alert_rules)
+    # ------------------------------------------------------------------
+    #   既存 session に user 定義 rule を 適用、 校正・保守閾値の 静的 gate。
+    #   Bench.check_alerts + MCP wrapper の 両層 verify。
+    print("\n--- [25] v0.10.0-alpha: declarative alert rule engine ---")
+
+    # seed session: mock で 20 回、 統計を 制御しやすいよう interval_ms=0
+    s25 = BENCH.measure(port=MOCK_PORT, samples=30, interval_ms=0, note="alert-test")
+    assert len(s25.rows) == 30
+    print(f"[25a] seed session for alert: sid={s25.id} n={len(s25.rows)} channels={s25.channels}")
+
+    # [25b] per-row gt: mock T は 24-26 帯なので T > 25 は 一部 match
+    r25b = check_alert_rules(
+        rules=[{"channel": "T", "op": "gt", "threshold": 25.0,
+                "severity": "warn", "label": "high-temp"}],
+        sid=s25.id,
+    )
+    assert r25b["n_rules"] == 1
+    assert len(r25b["alerts"]) == 1
+    assert r25b["alerts"][0]["level"] == "row"
+    assert r25b["alerts"][0]["skip_reason"] is None
+    assert r25b["alerts"][0]["severity"] == "warn"
+    assert r25b["alerts"][0]["label"] == "high-temp"
+    # match_count は 実測 randomness 依存だが 0 以上、 matched フラグと 一貫
+    assert r25b["alerts"][0]["matched"] == (r25b["alerts"][0]["match_count"] > 0)
+    assert r25b["critical_count"] == 0
+    print(f"[25b] per-row gt(T>25): match_count={r25b['alerts'][0]['match_count']} "
+          f"matched={r25b['alerts'][0]['matched']} any_matched={r25b['any_matched']}")
+
+    # [25c] session-level stdev_gt: mock T の stdev は 0.5 前後、 stdev>0.01 は
+    # ほぼ確実に match、 stdev>10 は 絶対 unmatch
+    r25c = check_alert_rules(
+        rules=[
+            {"channel": "T", "op": "stdev_gt", "threshold": 0.01,
+             "severity": "critical", "label": "noise-floor"},
+            {"channel": "T", "op": "stdev_gt", "threshold": 10.0,
+             "severity": "info", "label": "impossibly-noisy"},
+        ],
+        sid=s25.id,
+    )
+    assert r25c["n_rules"] == 2
+    assert r25c["alerts"][0]["level"] == "session"
+    assert r25c["alerts"][0]["matched"] is True
+    assert r25c["alerts"][0]["severity"] == "critical"
+    assert r25c["alerts"][1]["matched"] is False
+    assert r25c["critical_count"] == 1
+    assert r25c["info_count"] == 0
+    print(f"[25c] session stdev_gt: crit(0.01)={r25c['alerts'][0]['matched']} "
+          f"info(10.0)={r25c['alerts'][1]['matched']} crit_count={r25c['critical_count']}")
+
+    # [25d] guards: channel_not_found + unknown_op + missing_required_field + zero_variance
+    # zero_variance 用に phase [14] の _ConstDevice pattern を 再利用 (V チャンネル一定)
+    BENCH._devices["const-alert@9600"] = _ConstDevice(3.3)
+    s25d_const = BENCH.measure(port="const-alert", samples=10, interval_ms=0,
+                                note="selftest-alert-const")
+
+    r25d = check_alert_rules(
+        rules=[
+            {"channel": "NONEXIST", "op": "gt", "threshold": 0.0, "label": "no-ch"},
+            {"channel": "V", "op": "no_such_op", "threshold": 1.0, "label": "bad-op"},
+            {"channel": "V", "op": "gt", "label": "missing-threshold"},
+            {"channel": "V", "op": "sigma", "threshold": 3.0, "label": "sigma-const"},
+        ],
+        sid=s25d_const.id,
+    )
+    assert r25d["n_rules"] == 4
+    reasons = [a["skip_reason"] for a in r25d["alerts"]]
+    assert "channel_not_found" in reasons
+    assert "unknown_op" in reasons
+    assert "missing_required_field" in reasons
+    assert "zero_variance" in reasons
+    assert r25d["n_rules_skipped"] == 4
+    assert r25d["any_matched"] is False
+    print(f"[25d] guards: {reasons} skipped={r25d['n_rules_skipped']} "
+          f"any_matched={r25d['any_matched']}")
+
+    # [25e] severity fallback: invalid severity → 'warn'
+    r25e = check_alert_rules(
+        rules=[{"channel": "T", "op": "stdev_gt", "threshold": 0.0,
+                "severity": "URGENT_MEGA", "label": "bad-sev"}],
+        sid=s25.id,
+    )
+    assert r25e["alerts"][0]["severity"] == "warn"
+    assert r25e["alerts"][0]["matched"] is True
+    print(f"[25e] invalid severity 'URGENT_MEGA' → fallback='{r25e['alerts'][0]['severity']}'")
+
+    # [25f] structured error on nonexistent session_id + invalid rules type
+    r25f1 = check_alert_rules(rules=[], sid="nonexistent-session-xyz")
+    assert r25f1.get("error") == "session_not_found"
+    r25f2 = check_alert_rules(rules="not a list", sid=s25.id)  # type: ignore[arg-type]
+    assert r25f2.get("error") == "invalid_rules"
+    print(f"[25f] structured errors: nonexistent={r25f1.get('error')} "
+          f"invalid_rules={r25f2.get('error')}")
+
     print("\n全テスト成功。実機が無くてもこのサーバーは動作します。")
     print("v0.5.0-alpha SPIKE: import_external_session + SafetyGate + source field 追加 動作確認。")
     print("v0.6.0-alpha: physics-limits pre-flight (Bekenstein/Landauer/Lloyd/op-space/compression) 動作確認。")
@@ -3076,6 +3439,7 @@ def _selftest() -> int:
     print("v0.8.0-alpha SPIKE: Akizuki wire-up 3 layer mock (env/IMU/ToF) 動作確認。")
     print("v0.9.0-alpha SPIKE: Akizuki chemistry layer mock (SCD40 CO2 / SGP40 VOC) 動作確認。")
     print("v0.9.1-alpha SPIKE: Akizuki UART chemistry layer mock (MH-Z19C CO2) 動作確認。")
+    print("v0.10.0-alpha: declarative alert rule engine (check_alert_rules) 動作確認。 v1.0 は defer 継続。")
     return 0
 
 
