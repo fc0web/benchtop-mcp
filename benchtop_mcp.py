@@ -1109,6 +1109,7 @@ from benchtop_physics_limits import (  # noqa: E402
     lloyd_computation_ceiling as _pl_lloyd,
     operator_space_size as _pl_operator_space,
     compression_upper_bound as _pl_compression,
+    relational_compression_bound as _pl_relational_compression,  # STEP 1723 (v0.13)
 )
 
 # v0.7.0-alpha (2026-08-23): olfact / biosensor mock spike
@@ -1197,7 +1198,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.12.0-alpha",
+    version="0.13.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -1259,6 +1260,14 @@ server = MCPServer(
         "embedded fixture のみ動作、 実 SmellNet DL は 別 STEP directive 待ち = 継続。 replay path でも "
         "hardware_available: False + is_embedded_fixture: True marker 明示、 「mock でない real dataset "
         "使用」 の 誤読 予防 継続 ([[feedback-super-naming-siren-family-pattern]])。"
+        "v0.13.0-alpha 追加: relational_compression_bound 1 tool — K(x|y) 条件付き 圧縮長 上界。 "
+        "Rei-AIOS STEP 1723 (chat-Claude 2026-09-03 「負のファイルサイズ」 arc)、 藤本さん directive "
+        "「関係量を一等市民化」 応答。 4 modes (dedup / delta / model / entanglement) で 「受け手が 事前 "
+        "共有 して いる 資源」 に対する 引き当て credit を 計算、 entanglement mode は "
+        "Horodecki-Oppenheim-Winter 2005 Nature の negative conditional entropy 会計 (signed_bound_bits "
+        "が 負値化) を wrap、 但し channel_bits_min は 常に ≥ 0 (物理 通信路 の 実 bit は 減らない、 "
+        "「引き当てられる credit」 だけ が 負)。 K(x|y) uncomputable disclaimer 継続、 dedup overlap は "
+        "trust input 明示。 pure calc (stdlib のみ、 状態なし)。"
     ),
 )
 
@@ -1784,6 +1793,85 @@ def compression_upper_bound(
     compression_ratio_min, is_upper_bound, kolmogorov_note, assumptions, ...
     """
     return _pl_compression(length, entropy_bits_per_symbol, method)
+
+
+# ---------------------------------------------------------------------------
+# v0.13.0-alpha (2026-09-03, Rei-AIOS STEP 1723): relational compression bound
+# ---------------------------------------------------------------------------
+#   chat-Claude 2026-09-03 arc 「負のファイルサイズ」 → 「絶対量ではなく、 条件付き量
+#   を見よ」 → 藤本さん directive 「関係量を benchtop に 一等市民化」 応答。
+#
+#   絶対 compression bound (compression_upper_bound) は 「受け手が 何も 持って いない」
+#   前提。 本 tool は 4 種類 の 事前共有 prior を 明示 引数 で 取り、 K(x|y) ≤
+#   N × H(X|Y) + O(log N) を 返す。
+#
+#   4 modes:
+#     "dedup"       : payload matches receiver store (overlap_fraction)
+#     "delta"       : receiver has previous version, sender sends δ
+#     "model"       : receiver has generative model M, sender sends residuals
+#     "entanglement": Horodecki-Oppenheim-Winter 2005 Nature accounting wrap;
+#                     signed_bound_bits can go NEGATIVE (chat-Claude
+#                     「-1,000,000 バイト」 scenario の operational 形)
+#
+#   ★ channel_bits_min = max(0, signed_bound_bits) は 常に ≥ 0 (物理 通信路)。
+#   ★ K(x|y) uncomputable 明示。 dedup overlap は trust input 明示。
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def relational_compression_bound(
+    payload_bits: int,
+    prior_kind: str,
+    prior_capacity_bits: int = 0,
+    conditional_entropy_bits_per_symbol: float | None = None,
+    overlap_fraction: float | None = None,
+    mutual_information_bits: float | None = None,
+    pointer_bits_override: int | None = None,
+) -> dict[str, Any]:
+    """受け手が 事前共有 して いる prior を 前提 に した K(x|y) 上界 (bits)。
+
+    絶対 compression bound は 「受け手が 何も 持って いない」 前提の N × H。
+    本 tool は 4 mode の shared prior を 明示引数 に 取り、 credit を 計算する。
+
+    Four prior_kind modes:
+      "dedup"       : overlap_fraction が payload と store の 一致率、 pointer + 残差
+      "delta"       : conditional_entropy_bits_per_symbol = H(X|Y_prev) (per-bit)
+      "model"       : conditional_entropy_bits_per_symbol = H(X|model) (per-bit)
+      "entanglement": mutual_information_bits = I(X;Y_ent) per-bit ([0,2] range、
+                      >1.0 で signed_bound_bits が 負値化 = Horodecki-Oppenheim-
+                      Winter 2005 Nature の negative conditional entropy 会計)。
+
+    ★★★ CRITICAL discipline:
+      - K(x|y) は Turing-uncomputable (Chaitin 1975)、 本 tool は Slepian-Wolf /
+        Wyner-Ziv 統計的上界のみ。
+      - entanglement mode の signed_bound_bits < 0 は 「事前共有した ebit への
+        引き当て credit」 の 会計であり、 物理 通信路 の 実 bit が 負に なる ことでは
+        ない。 channel_bits_min は 常に ≥ 0。
+      - dedup overlap_fraction は 呼出側 trust input、 実 data からの verify は しない。
+
+    Args:
+        payload_bits: 送出 対象 の 総 bit 数 (uncompressed)、 must be int >= 0。
+        prior_kind: "dedup" | "delta" | "model" | "entanglement"。
+        prior_capacity_bits: receiver 側 store 容量 (dedup で pointer 長計算に使用)。
+        conditional_entropy_bits_per_symbol: H(X|Y) per bit、 delta / model mode 必須。
+        overlap_fraction: dedup mode 必須、 [0, 1]。
+        mutual_information_bits: entanglement mode 必須、 [0, 2] (per-bit)。
+        pointer_bits_override: dedup で pointer 長を 明示指定 (test 用)。
+
+    Returns dict with: prior_kind, payload_bits, absolute_bound_bits, signed_bound_bits
+    (entanglement で 負可), channel_bits_min (常に ≥ 0), credit_bits, credit_ratio,
+    ebit_ledger_bits (entanglement のみ 意味あり), is_negative_size, is_upper_bound,
+    kolmogorov_note, assumptions, citation, honest_scope。
+    """
+    return _pl_relational_compression(
+        payload_bits=payload_bits,
+        prior_kind=prior_kind,
+        prior_capacity_bits=prior_capacity_bits,
+        conditional_entropy_bits_per_symbol=conditional_entropy_bits_per_symbol,
+        overlap_fraction=overlap_fraction,
+        mutual_information_bits=mutual_information_bits,
+        pointer_bits_override=pointer_bits_override,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3267,6 +3355,61 @@ def _selftest() -> int:
     assert all(not r["ok"] for r in (r20f1, r20f2, r20f3, r20f4, r20f5))
 
     # ------------------------------------------------------------------
+    # [20g] v0.13.0-alpha: relational_compression_bound (Rei-AIOS STEP 1723)
+    # ------------------------------------------------------------------
+    #   MCP tool 層で module 実装との 一致 verify (module 側 selftest 84/84 PASS 済)。
+    print("\n--- [20g] v0.13.0-alpha: relational_compression_bound MCP wire (STEP 1723) ---")
+
+    # 4 modes each on N=1000 bits
+    r20g1 = relational_compression_bound(
+        payload_bits=1000, prior_kind="dedup", prior_capacity_bits=1024,
+        overlap_fraction=0.8,
+    )
+    assert r20g1["ok"] is True
+    assert abs(r20g1["signed_bound_bits"] - 207.0) < 0.01
+    assert r20g1["is_negative_size"] is False
+    assert r20g1["ebit_ledger_bits"] == 0.0
+
+    r20g2 = relational_compression_bound(
+        payload_bits=1000, prior_kind="delta",
+        conditional_entropy_bits_per_symbol=0.1,
+    )
+    assert r20g2["ok"] is True
+    assert abs(r20g2["signed_bound_bits"] - 110.0) < 0.01
+
+    r20g3 = relational_compression_bound(
+        payload_bits=1000, prior_kind="model",
+        conditional_entropy_bits_per_symbol=0.3,
+    )
+    assert r20g3["ok"] is True
+    assert abs(r20g3["signed_bound_bits"] - 302.0) < 0.01
+
+    # ★ entanglement, I(X;Y)=1.5 → signed_bound=-500 (NEGATIVE, chat-Claude scenario)
+    r20g4 = relational_compression_bound(
+        payload_bits=1000, prior_kind="entanglement",
+        mutual_information_bits=1.5,
+    )
+    assert r20g4["ok"] is True
+    assert r20g4["signed_bound_bits"] == -500.0
+    assert r20g4["is_negative_size"] is True
+    assert r20g4["channel_bits_min"] == 0.0  # physical wire never negative
+    assert r20g4["ebit_ledger_bits"] == -500.0
+    assert r20g4["credit_bits"] == 1000.0
+    assert "Horodecki-Oppenheim-Winter" in " ".join(r20g4["citation"])
+
+    print(f"[20g] relational: dedup=207 delta=110 model=302 entanglement(I=1.5)=-500 (NEGATIVE)")
+    print(f"      channel_bits_min={r20g4['channel_bits_min']} ebit_ledger={r20g4['ebit_ledger_bits']}")
+
+    # [20g-inv] invalid inputs
+    r20g_inv1 = relational_compression_bound(100, "gzip")
+    r20g_inv2 = relational_compression_bound(100, "dedup")  # missing overlap
+    r20g_inv3 = relational_compression_bound(100, "delta")  # missing entropy
+    r20g_inv4 = relational_compression_bound(100, "entanglement", mutual_information_bits=3.0)
+    assert all(not r["ok"] for r in (r20g_inv1, r20g_inv2, r20g_inv3, r20g_inv4))
+    print(f"[20g] invalid: bad_kind={not r20g_inv1['ok']} no_overlap={not r20g_inv2['ok']} "
+          f"no_entropy={not r20g_inv3['ok']} bad_mi={not r20g_inv4['ok']}")
+
+    # ------------------------------------------------------------------
     # [21] v0.7.0-alpha: olfact / biosensor mock spike (3 MCP tool wire)
     # ------------------------------------------------------------------
     #   MCP tool 層で module 実装との 一致 verify (module 側 selftest 35/35 PASS 済)。
@@ -3611,6 +3754,7 @@ def _selftest() -> int:
     print("v0.9.0-alpha SPIKE: Akizuki chemistry layer mock (SCD40 CO2 / SGP40 VOC) 動作確認。")
     print("v0.9.1-alpha SPIKE: Akizuki UART chemistry layer mock (MH-Z19C CO2) 動作確認。")
     print("v0.10.0-alpha: declarative alert rule engine (check_alert_rules) 動作確認。 v1.0 は defer 継続。")
+    print("v0.13.0-alpha: relational_compression_bound (K(x|y) 条件付き上界、 4 modes、 entanglement で 負可) 動作確認。")
 
     # -----------------------------------------------------------------------
     # [26] v0.12.0-alpha: SmellNet replay adapter MCP wire (2 tool)

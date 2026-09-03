@@ -21,6 +21,9 @@ v0.6.0-alpha (2026-08-20, chat-Claude 2026-08-20 turn 「コネクタの本体�
   3. lloyd_computation_ceiling(mass_kg) → Lloyd 2000 究極的 ops/s 上限
   4. operator_space_size(k, n) → k 値 n 変数 演算子空間 (log10 N + LUT + config)
   5. compression_upper_bound(length, method, entropy_bits_per_symbol) → 圧縮長 上界
+  6. relational_compression_bound(payload, prior_kind, ...) → K(x|y) 条件付き上界
+     (Rei-AIOS STEP 1723、 chat-Claude 2026-09-03 「負のファイルサイズ」 arc、
+      藤本さん directive 「関係量」 一等市民化)
 
 **★ 命名 discipline** ([[feedback-super-naming-siren-family-pattern]] 適用):
 
@@ -47,6 +50,13 @@ v0.6.0-alpha (2026-08-20, chat-Claude 2026-08-20 turn 「コネクタの本体�
       「上界の一つ」 を 返す のみ)。
   (7) [[feedback-world-uniqueness-claim-controllable]] 継承 = 「世界初」 主張ゼロ、
       全 tool は 60+ 年前の 教科書 定理 の operational wrap layer のみ。
+  (8) relational_compression_bound (v0.13、 STEP 1723) は 受け手 が 事前共有 して
+      いる 資源 (辞書 / 前 version / model / entanglement) を 条件 に した 上界。
+      classical modes (dedup/delta/model) は 通信 bits ≥ 0、 entanglement mode は
+      ebit ledger が 負に なりうる (Horodecki-Oppenheim-Winter 2005 Nature) が、
+      それは 「事前共有した ebit を 引き当てる」 会計 で あって 通信路 の 物理 bit
+      が 減る ことでは ない。 chat-Claude 2026-09-03 arc の 「-1,000,000 バイト =
+      既に どこかで 支払われた もの に対する 信用」 framing の operational wrap。
 
 **related memory**:
   - chat-Claude 2026-08-20 turn (「LLM が 自信満々に間違える 領域 = 単位付き算術」)
@@ -63,6 +73,11 @@ v0.6.0-alpha (2026-08-20, chat-Claude 2026-08-20 turn 「コネクタの本体�
   - Lloyd 2000, "Ultimate physical limits to computation", Nature 406:1047
   - Post 1921 / Rosser 1936 (k-valued logic function count formula k^(k^n))
   - Shannon 1948 (compression bound H · N)
+  - Slepian-Wolf 1973 IEEE Trans. Inf. Theory 19:471 (distributed coding H(X|Y))
+  - Wyner-Ziv 1976 IEEE Trans. Inf. Theory 22:1 (side-information at decoder)
+  - Horodecki-Oppenheim-Winter 2005 Nature 436:673 (negative conditional entropy,
+    quantum state merging, "partial quantum information")
+  - Chaitin 1975 J.ACM 22:329 (K uncomputability disclaimer)
 
 License: benchtop-mcp v0.x = MIT (irrevocable per README)。
 """
@@ -499,6 +514,292 @@ def compression_upper_bound(
 
 
 # ============================================================================
+# 6. Relational compression lower bound (K(x|y) upper bound with shared prior)
+# ============================================================================
+
+
+_VALID_PRIOR_KINDS = ("dedup", "delta", "model", "entanglement")
+
+
+def relational_compression_bound(
+    payload_bits: int,
+    prior_kind: str,
+    prior_capacity_bits: int = 0,
+    conditional_entropy_bits_per_symbol: float | None = None,
+    overlap_fraction: float | None = None,
+    mutual_information_bits: float | None = None,
+    pointer_bits_override: int | None = None,
+) -> dict[str, Any]:
+    """受け手 の 事前共有 資源 を 前提 に した 圧縮長 上界 (K(x|y) upper bound、 bits)。
+
+    chat-Claude 2026-09-03 arc 「絶対量ではなく、 条件付き量を見よ」 の operational wrap。
+    絶対 compression bound (compression_upper_bound) は 「受け手が 何も 持って いない」
+    前提 で N × H。 本 tool は 4 種類 の 事前共有 prior を 明示 引数 に 取り、
+    K(x|y) ≤ N × H(X|Y) + O(log N + log |Y|) を 返す。
+
+    Four prior_kind modes (chat-Claude framing 忠実 mapping):
+
+      "dedup"       : payload の overlap_fraction が 受け手 の store と 1:1 一致
+                      L_cond = (1 - overlap) × payload_bits + pointer_bits
+                      pointer_bits = ceil(log2(prior_capacity_bits / block_size))
+                      block_size = 8 bits (byte-granular default)
+
+      "delta"       : 前 version との XOR / diff、 receiver は 前 version 保持
+                      L_cond = payload_bits × conditional_entropy_bits_per_symbol
+                      (per-symbol H(X|Y_previous) は 呼出側 で 推定)
+
+      "model"       : receiver が 生成 model M を 共有、 sender は residual 送出
+                      L_cond = payload_bits × conditional_entropy_bits_per_symbol
+                      (LLM 圧縮 / arithmetic coding under model の 実践形)
+
+      "entanglement": Horodecki-Oppenheim-Winter 2005 Nature 「negative conditional
+                      entropy」 の 会計 wrap。 quantum state merging 定理 で
+                      S(A|B) < 0 の 場合、 sender は 0 量子 bit 送出 で 自分の 状態を
+                      Bob に merge でき、 |S(A|B)| ebits の entanglement が 手元に 残る。
+                      引数 mutual_information_bits I(X;Y) を 受け取り、
+                      signed_bound_bits = payload_bits × (H(X) - I(X;Y))
+                      が 負に なりうる (これが chat-Claude 「-1,000,000 バイト」 の
+                      operational 意味 = 事前共有 資源への 引き当て 会計)。
+                      classical channel bits (実 通信路 の 物理 bit) は 常に ≥ 0。
+
+    Args:
+        payload_bits: 送出 対象 の 総 bit 数 (uncompressed)、 must be int >= 0。
+        prior_kind: "dedup" | "delta" | "model" | "entanglement" の いずれか。
+        prior_capacity_bits: receiver 側 shared prior の 容量 (dedup では store
+            サイズ、 pointer_bits 計算 に 使用)、 default 0 (pointer_bits=0 相当)。
+        conditional_entropy_bits_per_symbol: H(X|Y) per bit of payload、
+            delta / model mode で 必須、 must be in [0, 1] (per-bit fraction)。
+        overlap_fraction: dedup mode で 必須、 must be in [0, 1]、 payload と
+            prior store の 一致 fraction (呼出側 が 独立 verify した trust input)。
+        mutual_information_bits: entanglement mode で 必須、 per-bit I(X;Y_ent)、
+            must be in [0, 1] (per-bit fraction、 entangled で 1.0 超え可 の 表現は
+            H(X)=1.0 baseline の 引き当てで 実現、 signed_bound が 負値化する 経路)。
+        pointer_bits_override: dedup mode で pointer 長を 明示指定 (test 用)、
+            通常は 自動計算 (ceil(log2(prior_capacity_bits/8))) を 使う。
+
+    Returns:
+        {
+          "ok": True,
+          "prior_kind": <str>,
+          "payload_bits": <int>,                    # 入力 baseline
+          "absolute_bound_bits": <int>,             # payload_bits (baseline H=1)
+          "signed_bound_bits": <float>,             # 条件付き上界 (entanglement で 負可)
+          "channel_bits_min": <float>,              # max(0, signed) = 実 通信路 min
+          "credit_bits": <float>,                   # absolute - channel_bits_min
+          "credit_ratio": <float>,                  # credit / absolute (0..1 classical)
+          "ebit_ledger_bits": <float>,              # entanglement の みで 意味、 他は 0
+          "is_negative_size": <bool>,               # signed_bound_bits < 0 sentinel
+          "is_upper_bound": True,                   # K(x|y) uncomputable disclaimer
+          "kolmogorov_note": "...",
+          "inputs": {...},
+          "assumptions": [...],
+          "citation": [...],
+          "honest_scope": "..."
+        }
+        On invalid input: {"ok": False, "error": "..."}
+
+    Honest scope (★ CRITICAL — chat-Claude arc discipline):
+      - **K(x|y) is Turing-uncomputable** (Chaitin 1975)。 本 tool は Slepian-Wolf /
+        Wyner-Ziv 統計的 上界のみ、 実 K(x|y) では ない。
+      - **dedup overlap_fraction は 呼出側 trust input**、 実 data からの 検証は しない
+        (dedup 実装 は 別 layer)。 誤 overlap 主張 → 誤 credit 結果。
+      - **entanglement mode は 会計 の wrap** であって 量子 channel を 開く ものでは
+        ない。 signed_bound_bits < 0 の 意味は 「事前 共有した ebit を 消費 して
+        payload_bits を 送るのに 相当」 であり、 実 通信路 の 物理 bit が 負に なる
+        こと では ない。 channel_bits_min は 常に ≥ 0。
+      - **Horodecki-Oppenheim-Winter (2005 Nature)** は 情報理論 の 定理 で、
+        entanglement 事前共有 (資源 前払い) 込みで 全 系 で 足せば 常に ≥ 0。
+        本 tool は 「引き当て可能な credit」 の 会計を 見える化 する だけ。
+      - Chat-Claude arc の 「-1,000,000 バイト = 既に どこかで 支払われた もの に
+        対する 信用」 framing は is_negative_size + ebit_ledger_bits < 0 に 対応。
+    """
+    if not isinstance(payload_bits, int) or payload_bits < 0:
+        return {"ok": False, "error": f"payload_bits must be int >= 0, got {payload_bits!r}"}
+    if prior_kind not in _VALID_PRIOR_KINDS:
+        return {
+            "ok": False,
+            "error": f"prior_kind must be one of {_VALID_PRIOR_KINDS}, got {prior_kind!r}",
+        }
+    if not isinstance(prior_capacity_bits, int) or prior_capacity_bits < 0:
+        return {
+            "ok": False,
+            "error": f"prior_capacity_bits must be int >= 0, got {prior_capacity_bits!r}",
+        }
+
+    N = payload_bits
+    absolute_bound = float(N)  # baseline: H=1, N bits raw
+    signed_bound = 0.0
+    ebit_ledger = 0.0
+    overhead = 0.0
+
+    # ---- dedup mode ----
+    if prior_kind == "dedup":
+        if overlap_fraction is None:
+            return {"ok": False, "error": "dedup mode requires overlap_fraction"}
+        if not isinstance(overlap_fraction, (int, float)) or not (0.0 <= overlap_fraction <= 1.0):
+            return {
+                "ok": False,
+                "error": f"overlap_fraction must be in [0,1], got {overlap_fraction!r}",
+            }
+        if pointer_bits_override is not None:
+            if not isinstance(pointer_bits_override, int) or pointer_bits_override < 0:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"pointer_bits_override must be int >= 0, got "
+                        f"{pointer_bits_override!r}"
+                    ),
+                }
+            pointer_bits = pointer_bits_override
+        else:
+            # block-size = 8 bits (byte-granular)
+            n_blocks = max(1, prior_capacity_bits // 8)
+            pointer_bits = int(math.ceil(math.log2(max(2, n_blocks))))
+        overhead = float(pointer_bits)
+        signed_bound = (1.0 - float(overlap_fraction)) * N + overhead
+
+    # ---- delta mode ----
+    elif prior_kind == "delta":
+        if conditional_entropy_bits_per_symbol is None:
+            return {
+                "ok": False,
+                "error": "delta mode requires conditional_entropy_bits_per_symbol",
+            }
+        h = float(conditional_entropy_bits_per_symbol)
+        if not (0.0 <= h <= 1.0):
+            return {
+                "ok": False,
+                "error": f"conditional_entropy_bits_per_symbol must be in [0,1], got {h!r}",
+            }
+        overhead = math.ceil(math.log2(max(2, N + 1)))
+        signed_bound = N * h + overhead
+
+    # ---- model mode ----
+    elif prior_kind == "model":
+        if conditional_entropy_bits_per_symbol is None:
+            return {
+                "ok": False,
+                "error": "model mode requires conditional_entropy_bits_per_symbol",
+            }
+        h = float(conditional_entropy_bits_per_symbol)
+        if not (0.0 <= h <= 1.0):
+            return {
+                "ok": False,
+                "error": f"conditional_entropy_bits_per_symbol must be in [0,1], got {h!r}",
+            }
+        # arithmetic coding practical overhead ~2 bits
+        overhead = 2.0
+        signed_bound = N * h + overhead
+
+    # ---- entanglement mode ----
+    else:  # "entanglement"
+        if mutual_information_bits is None:
+            return {
+                "ok": False,
+                "error": "entanglement mode requires mutual_information_bits (per-bit I(X;Y))",
+            }
+        i_xy = float(mutual_information_bits)
+        if not (0.0 <= i_xy <= 2.0):
+            # per-bit I(X;Y) can exceed 1.0 in the entangled superdense-coding regime
+            # (mutual info between quantum systems can be up to 2 H(X) via ebits).
+            # We cap at 2.0 as a hard sanity limit; anything above indicates misuse.
+            return {
+                "ok": False,
+                "error": (
+                    f"mutual_information_bits must be in [0,2] (per-bit fraction, "
+                    f"entangled ceiling 2 H(X)), got {i_xy!r}"
+                ),
+            }
+        # H(X) baseline = 1.0 per bit; conditional entropy S(A|B) per bit = H(X) - I(X;Y)
+        # For entangled ρ_AB, S(A|B) < 0 when I(X;Y) > H(X), i.e., i_xy > 1.0.
+        conditional_per_bit = 1.0 - i_xy
+        signed_bound = N * conditional_per_bit  # can be negative
+        # ebit ledger records the pre-shared resource consumed / gained
+        ebit_ledger = signed_bound  # mirror, since baseline H(X)=1
+        overhead = 0.0
+
+    channel_bits_min = max(0.0, signed_bound)
+    credit_bits = absolute_bound - channel_bits_min
+    credit_ratio = credit_bits / absolute_bound if absolute_bound > 0 else 0.0
+
+    citations = [
+        "Shannon 1948, Bell System Technical Journal 27:379",
+        "Slepian-Wolf 1973, IEEE Trans. Inf. Theory 19:471",
+        "Wyner-Ziv 1976, IEEE Trans. Inf. Theory 22:1",
+    ]
+    if prior_kind == "entanglement":
+        citations.append(
+            "Horodecki-Oppenheim-Winter 2005, Nature 436:673 "
+            "(negative conditional entropy, quantum state merging)"
+        )
+    citations.append("Chaitin 1975, J.ACM 22:329 (K uncomputability)")
+
+    assumptions = {
+        "dedup": [
+            "overlap_fraction is trust input (not verified from actual data)",
+            "byte-granular blocks (8 bits) for pointer size calculation",
+            "sender + receiver share the same content-addressed store",
+        ],
+        "delta": [
+            "receiver holds the previous version verbatim",
+            "conditional_entropy_bits_per_symbol is caller-provided estimate",
+            "diff transmission uses arithmetic-coded residuals",
+        ],
+        "model": [
+            "receiver has the identical generative model M",
+            "sender transmits arithmetic-coded residuals under model M",
+            "H(X|M) is caller-provided (LLM cross-entropy, etc.)",
+        ],
+        "entanglement": [
+            "sender and receiver pre-share entangled state ρ_AB",
+            "classical channel bits ≥ 0 always (physical wire cannot carry negative)",
+            "signed_bound < 0 = accounting credit against pre-shared ebits",
+            "Horodecki-Oppenheim-Winter (2005) state-merging regime, not experimental",
+        ],
+    }[prior_kind]
+
+    return {
+        "ok": True,
+        "prior_kind": prior_kind,
+        "payload_bits": N,
+        "absolute_bound_bits": absolute_bound,
+        "signed_bound_bits": signed_bound,
+        "channel_bits_min": channel_bits_min,
+        "credit_bits": credit_bits,
+        "credit_ratio": credit_ratio,
+        "ebit_ledger_bits": ebit_ledger,
+        "is_negative_size": signed_bound < 0.0,
+        "is_upper_bound": True,
+        "overhead_bits": overhead,
+        "kolmogorov_note": (
+            "K(x|y) is Turing-uncomputable (Chaitin 1975). This tool returns "
+            "Slepian-Wolf / Wyner-Ziv statistical upper bound with receiver-shared "
+            "prior. For entanglement mode, signed_bound_bits reflects the "
+            "Horodecki-Oppenheim-Winter (2005) accounting; classical channel bits "
+            "remain ≥ 0."
+        ),
+        "inputs": {
+            "payload_bits": N,
+            "prior_kind": prior_kind,
+            "prior_capacity_bits": prior_capacity_bits,
+            "conditional_entropy_bits_per_symbol": conditional_entropy_bits_per_symbol,
+            "overlap_fraction": overlap_fraction,
+            "mutual_information_bits": mutual_information_bits,
+            "pointer_bits_override": pointer_bits_override,
+        },
+        "assumptions": assumptions,
+        "citation": citations,
+        "honest_scope": (
+            "K(x|y) uncomputable — statistical upper bound only. dedup overlap is "
+            "trust input. entanglement mode is an accounting wrap of "
+            "Horodecki-Oppenheim-Winter (2005): signed_bound < 0 means credit "
+            "against pre-shared ebits, NOT physical wire carrying negative bits. "
+            "channel_bits_min is always >= 0."
+        ),
+    }
+
+
+# ============================================================================
 # Self-test (module-level, runs when invoked directly)
 # ============================================================================
 
@@ -593,6 +894,154 @@ def _selftest() -> int:
     _check("arithmetic overhead ~2", abs(r["practical_upper_bound_bits"] - 502) < 1)
     _check("invalid method rejected", compression_upper_bound(100, 1, "gzip")["ok"] is False)
     _check("negative length rejected", compression_upper_bound(-1, 1, "shannon")["ok"] is False)
+
+    # ---- 6. relational_compression_bound (STEP 1723, v0.13) ----
+    print("\n[6] relational_compression_bound")
+
+    # 6a. invalid prior_kind
+    r = relational_compression_bound(100, "gzip")
+    _check("invalid prior_kind rejected", r["ok"] is False)
+    r = relational_compression_bound(-1, "dedup", overlap_fraction=0.5)
+    _check("negative payload rejected", r["ok"] is False)
+
+    # 6b. dedup: 80% overlap of 1000 bits, 1024-bit prior store
+    r = relational_compression_bound(
+        payload_bits=1000,
+        prior_kind="dedup",
+        prior_capacity_bits=1024,
+        overlap_fraction=0.8,
+    )
+    _check("dedup ok", r["ok"])
+    _check("dedup absolute=1000", r["absolute_bound_bits"] == 1000.0)
+    # (1 - 0.8) × 1000 + pointer_bits(log2(1024/8)=log2(128)=7) = 207
+    _check(f"dedup signed ~207 (got {r['signed_bound_bits']})",
+           abs(r["signed_bound_bits"] - 207.0) < 0.01)
+    _check("dedup channel_bits_min == signed (positive)",
+           r["channel_bits_min"] == r["signed_bound_bits"])
+    _check("dedup credit ~793", abs(r["credit_bits"] - 793.0) < 0.01)
+    _check(f"dedup credit_ratio ~0.793 (got {r['credit_ratio']:.3f})",
+           abs(r["credit_ratio"] - 0.793) < 0.01)
+    _check("dedup not negative", r["is_negative_size"] is False)
+    _check("dedup ebit_ledger=0", r["ebit_ledger_bits"] == 0.0)
+
+    # 6c. dedup edge: overlap=1.0 (perfect match), only pointer overhead
+    r = relational_compression_bound(1000, "dedup", 1024, overlap_fraction=1.0)
+    _check(f"dedup 100% overlap → pointer only (got {r['signed_bound_bits']})",
+           abs(r["signed_bound_bits"] - 7.0) < 0.01)
+
+    # 6d. dedup requires overlap_fraction
+    r = relational_compression_bound(100, "dedup", 1024)
+    _check("dedup w/o overlap_fraction rejected", r["ok"] is False)
+
+    # 6e. delta: H(X|Y_prev) = 0.1 per bit, 1000 bits
+    r = relational_compression_bound(
+        1000, "delta", conditional_entropy_bits_per_symbol=0.1
+    )
+    _check("delta ok", r["ok"])
+    # 1000 × 0.1 + ceil(log2(1001)) = 100 + 10 = 110
+    _check(f"delta signed ~110 (got {r['signed_bound_bits']})",
+           abs(r["signed_bound_bits"] - 110.0) < 0.01)
+    _check("delta credit ~890", abs(r["credit_bits"] - 890.0) < 0.01)
+
+    # 6f. delta requires conditional_entropy
+    r = relational_compression_bound(100, "delta")
+    _check("delta w/o entropy rejected", r["ok"] is False)
+    # entropy out of range
+    r = relational_compression_bound(100, "delta", conditional_entropy_bits_per_symbol=1.5)
+    _check("delta entropy > 1 rejected", r["ok"] is False)
+
+    # 6g. model: LLM cross-entropy 0.3 per bit, 1000 bits
+    r = relational_compression_bound(
+        1000, "model", conditional_entropy_bits_per_symbol=0.3
+    )
+    _check("model ok", r["ok"])
+    # 1000 × 0.3 + 2 = 302
+    _check(f"model signed ~302 (got {r['signed_bound_bits']})",
+           abs(r["signed_bound_bits"] - 302.0) < 0.01)
+
+    # 6h. entanglement: classical case I(X;Y)=0 → signed = payload
+    r = relational_compression_bound(
+        1000, "entanglement", mutual_information_bits=0.0
+    )
+    _check("entanglement classical ok", r["ok"])
+    _check("entanglement I=0 signed=1000", r["signed_bound_bits"] == 1000.0)
+    _check("entanglement I=0 not negative", r["is_negative_size"] is False)
+
+    # 6i. entanglement: fully correlated I(X;Y)=1 → signed = 0
+    r = relational_compression_bound(1000, "entanglement", mutual_information_bits=1.0)
+    _check("entanglement I=1 signed=0", r["signed_bound_bits"] == 0.0)
+    _check("entanglement I=1 channel_bits_min=0", r["channel_bits_min"] == 0.0)
+
+    # 6j. entanglement: superdense-regime I(X;Y)=1.5 → signed = -500 (NEGATIVE!)
+    #     This is the chat-Claude "-1,000,000 bytes" scenario in operational form.
+    r = relational_compression_bound(1000, "entanglement", mutual_information_bits=1.5)
+    _check("entanglement I=1.5 signed=-500 (NEGATIVE)",
+           r["signed_bound_bits"] == -500.0)
+    _check("entanglement I=1.5 is_negative_size flag", r["is_negative_size"] is True)
+    _check("entanglement I=1.5 channel_bits_min=0 (never negative)",
+           r["channel_bits_min"] == 0.0)
+    _check("entanglement I=1.5 ebit_ledger=-500",
+           r["ebit_ledger_bits"] == -500.0)
+    _check("entanglement I=1.5 credit=1000 (full)",
+           r["credit_bits"] == 1000.0)
+
+    # 6k. entanglement requires mutual_information_bits
+    r = relational_compression_bound(100, "entanglement")
+    _check("entanglement w/o mi rejected", r["ok"] is False)
+    # I(X;Y) out of range
+    r = relational_compression_bound(100, "entanglement", mutual_information_bits=2.5)
+    _check("entanglement I > 2 rejected", r["ok"] is False)
+
+    # 6l. kolmogorov_note present in all modes
+    for pk_args in [
+        ("dedup", {"overlap_fraction": 0.5, "prior_capacity_bits": 1024}),
+        ("delta", {"conditional_entropy_bits_per_symbol": 0.5}),
+        ("model", {"conditional_entropy_bits_per_symbol": 0.5}),
+        ("entanglement", {"mutual_information_bits": 0.5}),
+    ]:
+        r = relational_compression_bound(100, pk_args[0], **pk_args[1])
+        _check(
+            f"{pk_args[0]} has kolmogorov_note",
+            "uncomputable" in r.get("kolmogorov_note", ""),
+        )
+        _check(
+            f"{pk_args[0]} has honest_scope",
+            len(r.get("honest_scope", "")) > 50,
+        )
+        _check(
+            f"{pk_args[0]} has is_upper_bound flag",
+            r.get("is_upper_bound") is True,
+        )
+        _check(
+            f"{pk_args[0]} has citation list",
+            isinstance(r.get("citation"), list) and len(r["citation"]) >= 3,
+        )
+
+    # 6m. pointer_bits_override for reproducible test
+    r = relational_compression_bound(
+        1000, "dedup", 1024, overlap_fraction=0.5, pointer_bits_override=16
+    )
+    _check(f"dedup pointer override 16 → signed=516 (got {r['signed_bound_bits']})",
+           abs(r["signed_bound_bits"] - 516.0) < 0.01)
+
+    # 6n. absolute vs conditional invariant (dedup can never exceed absolute)
+    for overlap in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        r = relational_compression_bound(
+            1000, "dedup", 1024, overlap_fraction=overlap
+        )
+        _check(
+            f"dedup overlap={overlap} channel_bits_min <= absolute + pointer",
+            r["channel_bits_min"] <= r["absolute_bound_bits"] + 7,
+        )
+
+    # 6o. entanglement mode: only mode where ebit_ledger != 0
+    for pk_args in [
+        ("dedup", {"overlap_fraction": 0.5, "prior_capacity_bits": 1024}),
+        ("delta", {"conditional_entropy_bits_per_symbol": 0.5}),
+        ("model", {"conditional_entropy_bits_per_symbol": 0.5}),
+    ]:
+        r = relational_compression_bound(100, pk_args[0], **pk_args[1])
+        _check(f"{pk_args[0]} ebit_ledger=0", r["ebit_ledger_bits"] == 0.0)
 
     print()
     print("=" * 70)
