@@ -382,15 +382,35 @@ def _resolve_sid(sid: str, session_id: str) -> str | dict[str, Any]:
     根本原因は proxy 側だが別 repo・別スコープなので、こちらは正名を `sid` に移し、
     `session_id` を別名として残す (直結 Claude Desktop の既存呼び出しは無変更で動く)。
 
+    2026-09-09: proxy の実体コードは Nobuki のローカル全体にも存在せず (broad
+    search 済)、systemic fix は着手不能。代わりに **観測窓** を張る:
+    - 両方空で入ってきた場合 → proxy 剥離の可能性を stderr に記録
+    - session_id 経由で resolve できた場合 → 直結 or proxy fix landing の signal
+    stderr のみ (stdout は JSON-RPC framing 用、汚染禁止)。
+
     どちらも空なら structured error dict を返す (例外は投げない = 既存 contract 維持)。
     """
+    sid_present = bool(sid and sid.strip())
+    session_id_present = bool(session_id and session_id.strip())
     target = (sid or session_id or "").strip()
     if not target:
+        print(
+            "[benchtop:_resolve_sid] both 'sid' and 'session_id' empty — "
+            "may indicate remote-devices proxy stripping "
+            "(see benchtop_mcp.py:_resolve_sid docstring)",
+            file=sys.stderr, flush=True,
+        )
         return {
             "ok": False,
             "error": "session ID is required — pass it as 'sid' (preferred) or 'session_id'",
             "hint": "list_sessions() で ID を確認してください",
         }
+    if session_id_present and not sid_present:
+        print(
+            "[benchtop:_resolve_sid] resolved via 'session_id' alias — "
+            "either direct connection (proxy bypassed) or proxy no longer strips",
+            file=sys.stderr, flush=True,
+        )
     return target
 
 
