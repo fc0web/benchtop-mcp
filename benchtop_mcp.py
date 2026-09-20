@@ -3889,11 +3889,13 @@ def _selftest() -> int:
     assert hasattr(BENCH, "send_command"), "[27] Bench.send_command class method missing"
     assert callable(BENCH.send_command), "[27] Bench.send_command not callable"
 
-    # CLI dispatcher (_cli_send_command) を 実際に 呼び、 stdout を capture して
-    # JSON payload を parse verify。 argparse / __main__ dispatcher / Bench 到達
-    # の 全 chain を 1 shot で 検証する (chat-Claude 2026-09-21 review 反映、
-    # 元 helper は "Bench.send_command 直接叩き" だけで CLI 経路を test して
-    # おらず、 print 文言 と 実測 が 一致していなかった Pattern L を fix)。
+    # _cli_send_command を 実際に 呼び、 stdout を capture して JSON payload
+    # を parse verify。 argparse (argv → args.port/command/baudrate) と
+    # Bench.send_command 到達 の 2 chain を 実測 する。 __main__ block の
+    # entry 分岐 (sys.argv[1] == "send_command") は 本 test では 通って
+    # おらず、 subprocess 経由 の [27b] 候補 として 保留 (chat-Claude
+    # 2026-09-21 review round 2 指摘 per、 「全 chain」 と 書いた 初稿 は
+    # Pattern L の 二重発火)。
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         cli_rc = _cli_send_command([MOCK_PORT, "*IDN?"])
@@ -3909,8 +3911,9 @@ def _selftest() -> int:
     print(f"[27] send_command MCP tool 面 除去 verify: "
           f"MCP tools={len(tool_names)} (send_command 不在)、 "
           f"Bench.send_command class method 保持、 "
-          f"CLI dispatcher 実測 (port={payload['port']} sent={payload['sent']!r} "
-          f"response={payload['response']!r})。")
+          f"_cli_send_command 実測 (argparse + Bench、 __main__ entry 未 test): "
+          f"port={payload['port']} sent={payload['sent']!r} "
+          f"response={payload['response']!r}。")
 
     return 0
 
