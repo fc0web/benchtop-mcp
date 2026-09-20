@@ -25,7 +25,7 @@ v0.14.0-alpha 以前 の 版履歴は README.md の Version 節を参照。
   - `server._tool_manager.list_tools()` を query して `"send_command"` が 含まれない ことを assertion。
   - Canary として `"list_ports"` と `"measure"` が 依然 含まれる ことも verify (test infra 自体の meaningfulness 保証)。
   - `Bench.send_command` class method が 保持 されている ことを `hasattr` + `callable` で verify。
-  - CLI 経路の 実装本体到達性 を `_cli_send_command_test_helper()` 経由で smoke。
+  - `_cli_send_command` を `redirect_stdout` 下 で 直接呼び、 argparse (argv → args.port/command/baudrate) と `Bench.send_command` 到達 の **2 chain** を JSON payload parse verify (round 2 で `_cli_send_command_test_helper` からの refactor、 af2a4c2)。 `__main__` block の entry 分岐 (`sys.argv[1] == "send_command"`) は 本 test では 通っておらず、 subprocess 経由 の **[27b] 候補** として 保留 (round 3 で code comment 側 narrowing、 a59cdd6、 但し 本 CHANGELOG 側 は round 1 描写 の まま 残留していた ので STEP 2168 で 訂正)。
   - **失敗時 diagnostic**: 現在 tool 数 と "send" を 名前に含む tool の 一覧を assertion message に 埋込。 うっかり `@server.tool()` で 再登録した 場合、 「どこで 何が 起きたか」 が 即分かる。
 - **CHANGELOG.md** (本ファイル)。
 
