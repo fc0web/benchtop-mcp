@@ -21,6 +21,7 @@ AI エージェント（Claude など）に対して、以下の「できるこ�
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -1218,7 +1219,7 @@ from mcp.server import MCPServer  # noqa: E402
 
 server = MCPServer(
     name="benchtop",
-    version="0.13.0-alpha",
+    version="0.14.0-alpha",
     instructions=(
         "シリアル接続された計測装置・回路を操作し、測定値を記録・解析するツール群です。"
         "実機が無い場合は port='mock' を指定すると内蔵の仮想装置が使えます。"
@@ -1302,16 +1303,14 @@ def list_ports() -> dict[str, Any]:
     return {"ports": BENCH.list_ports(), "pyserial_available": HAS_SERIAL}
 
 
-@server.tool()
-def send_command(port: str, command: str, baudrate: int = 9600) -> dict[str, Any]:
-    """装置に1行のコマンドを送り、返ってきた1行を読む。
-
-    Args:
-        port: 装置のポート名。'mock' で内蔵仮想装置。実機は 'COM3' や '/dev/ttyUSB0' など。
-        command: 送信する文字列。改行は自動で付与される。例: '*IDN?'
-        baudrate: 通信速度。装置の設定に合わせる。既定は 9600。
-    """
-    return {"port": port, "sent": command, "response": BENCH.send_command(port, command, baudrate)}
+# v0.14.0-alpha (2026-09-20, STEP 2159): send_command は MCP tool 面から除去。
+# 任意 SCPI 文字列を機器に投げる汎用口が MCP に露出していると、 モデルが SafetyGate
+# 未経由の任意コマンドを組み立てられるため。 実装本体 (Bench.send_command class
+# method) は保持、 CLI subcommand `python benchtop_mcp.py send_command <port>
+# <command> [--baudrate N]` から呼べる。
+# ※ この歯止めは MCP-only client (Claude Desktop 等) に対してのみ有効。 shell を
+# 持つ agent (Claude Code 等) は CLI を直接叩けるため、 セキュリティ境界ではなく
+# 事故経路削減の措置として扱う。
 
 
 @server.tool()
@@ -3859,10 +3858,76 @@ def _selftest() -> int:
     print(f"[26g] invalid channel rejected: ok={r26g['ok']}")
 
     print("v0.12.0-alpha SPIKE: SmellNet replay adapter MCP wire (list_smellnet_substances / measure_eag_replay) 動作確認。")
+
+    # -----------------------------------------------------------------------
+    # [27] v0.14.0-alpha (STEP 2159): send_command が MCP tools/list に含まれ
+    #       ないことの回帰試験。 将来 うっかり @server.tool() で 再登録された
+    #       場合、 この phase が assertion で 落ちて 気付ける。
+    # -----------------------------------------------------------------------
+    tool_names = {t.name for t in server._tool_manager.list_tools()}
+    assert "send_command" not in tool_names, (
+        f"[27] regression: send_command was re-registered to MCP tool surface! "
+        f"v0.14.0-alpha removed it intentionally (STEP 2159). "
+        f"If re-adding is intentional, delete this assertion AND update CHANGELOG. "
+        f"Current tool count: {len(tool_names)}, tools with 'send' in name: "
+        f"{sorted(n for n in tool_names if 'send' in n)}"
+    )
+    # 存在するはずの基幹 tool が消えていないことも同時 verify (test 自体の meaningfulness)
+    assert "list_ports" in tool_names, "[27] canary: list_ports missing (test infra broken?)"
+    assert "measure" in tool_names, "[27] canary: measure missing (test infra broken?)"
+
+    # CLI 経路が到達可能なことを 直接検証 (Bench.send_command が class method として
+    # 保持されている、 かつ CLI dispatcher が argparse で受理する)
+    assert hasattr(BENCH, "send_command"), "[27] Bench.send_command class method missing"
+    assert callable(BENCH.send_command), "[27] Bench.send_command not callable"
+    cli_result = _cli_send_command_test_helper()
+    assert cli_result == 0, f"[27] CLI dispatcher returned non-zero: {cli_result}"
+
+    print(f"[27] send_command MCP tool 面 除去 verify: "
+          f"MCP tools={len(tool_names)} (send_command 不在)、 "
+          f"Bench.send_command class method 保持、 CLI 経路 到達可能。")
+
+    return 0
+
+
+def _cli_send_command_test_helper() -> int:
+    """v0.14.0-alpha selftest [27] 用 CLI dispatcher smoke。 mock port で 1 回叩く。
+
+    実装は _cli_send_command と 同型だが、 stdout capture を避ける ため print せず
+    argparse も呼ばずに Bench.send_command を 直接叩いて 到達可能性のみ verify する。
+    (argparse は 独立 test [27b] 候補、 現状は 実装本体到達を最小で確認)。
+    """
+    response = BENCH.send_command(MOCK_PORT, "*IDN?", 9600)
+    assert isinstance(response, str), f"expected str response, got {type(response).__name__}"
+    return 0
+
+
+def _cli_send_command(argv: list[str]) -> int:
+    """CLI subcommand: python benchtop_mcp.py send_command <port> <command> [--baudrate N]
+
+    v0.14.0-alpha (STEP 2159): send_command が MCP 面から除去された後の 唯一の
+    shell 経路。 Bench.send_command class method に そのまま接続、 応答を JSON で
+    stdout に出力する。 MCP wrapper の 返り値と 同一 shape (port / sent / response)。
+    """
+    parser = argparse.ArgumentParser(
+        prog="benchtop_mcp.py send_command",
+        description=(
+            "装置に1行のコマンドを送り、返ってきた1行を読む。 "
+            "v0.14.0-alpha 以降 MCP 面からは呼べない (安全化)、 CLI からのみ。"
+        ),
+    )
+    parser.add_argument("port", help="装置のポート名。'mock' で内蔵仮想装置。実機は 'COM3' や '/dev/ttyUSB0' など。")
+    parser.add_argument("command", help="送信する文字列。改行は自動で付与される。例: '*IDN?'")
+    parser.add_argument("--baudrate", type=int, default=9600, help="通信速度 (既定 9600)")
+    args = parser.parse_args(argv)
+    response = BENCH.send_command(args.port, args.command, args.baudrate)
+    print(json.dumps({"port": args.port, "sent": args.command, "response": response}, ensure_ascii=False))
     return 0
 
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
+    if len(sys.argv) >= 2 and sys.argv[1] == "send_command":
+        raise SystemExit(_cli_send_command(sys.argv[2:]))
     server.run(transport="stdio")

@@ -4,6 +4,10 @@
 
 **実機がなくても動きます。** 内蔵の仮想装置（`port="mock"`）があるので、ハードを繋ぐ前に全機能を試せます。
 
+**Version**: 0.14.0-alpha (2026-09-20) — **★ BREAKING: `send_command` を MCP tool 面から除去** (STEP 2159、 rei-aios chat-Claude 2026-09-20 arc 経由)。 任意 SCPI 文字列を機器に投げる汎用口が MCP に露出していると、 モデルが SafetyGate (v0.5) や physics-limits (v0.6) を経由せずに 任意コマンドを組み立てられる ため。 実装本体 (`Bench.send_command` class method) は保持、 新規 CLI subcommand `python benchtop_mcp.py send_command <port> <command> [--baudrate N]` で 引き続き 呼べる。 MCP tool 数: 34 → 33。 **honest scope**: 本変更は **MCP-only client (Claude Desktop 等) にのみ効く**。 shell を持つ agent (Claude Code 等) は CLI を直接叩けるので、 セキュリティ境界 ではなく **事故経路削減** の措置。 shell 持ち agent への 歯止めが要るなら 実行ユーザの権限 or 機器ファームウェア側の 上限 (別 layer)。 selftest phase [27] で 回帰試験 (「MCP tools/list に send_command が含まれないこと」 + 「戻すと 落ちること」) を verify。 CHANGELOG 参照。
+
+**★ 過去 Version**: 0.13.0-alpha (2026-08-25) — `relational_compression_bound` (K(x|y) 条件付き上界、 4 modes、 entanglement で 負可)。 詳細下記。
+
 **Version**: 0.11.0-alpha (2026-08-27) — **★ SmellNet replay adapter spike**: rei-scout 別 tab 発見 (2026-08-27 report Finding A: MIT-MI/SmellNet ★72, MIT License, MOX gas sensor, 50 substances + 43 mixtures, 828K timesteps / 68 hours) を rei-aios STEP 1474 candidate arc から STEP 1477 で 実装。 新 module `benchtop_olfact_smellnet_replay.py` (`load_smellnet_csv` / `load_embedded_fixture` / `get_replay_window` / `download_smellnet_stub`) と `benchtop_olfact.measure_eag()` の `replay_source` optional param 追加。 v0.7 mock path (deterministic hashlib.md5 seed) は backward compat 完全維持、 `data_source` field ('mock' | 'replay') で 機械的に 区別可能。 embedded synthetic fixture (3 substance × 3 channel × 100 timestep、 SmellNet 互換 CSV schema) で interface 動作 verify、 実 SmellNet DL は `download_smellnet_stub()` で 6 step documented (別 STEP directive 待ち = network / HF auth 依存回避 の spike scope)。 SNR は replay path で `(max-min)/stdev` proxy 計算、 verdict は STEP 1350 3-value subset (TRUE/NEITHER) 継続。 novelty ゼロ ([[feedback-world-uniqueness-claim-controllable]] 継承、 「SmellNet 使用」 は 論文レベル既存)。 selftest 拡張 42 (replay adapter 単体) + 20 (olfact 統合、 mock 15 baseline + replay 6 = 6 追加) = 累計 62/62 PASS。 STEP 1477。
 
 **★ 過去 Version**: 0.10.0-alpha (2026-08-27) — 宣言的 alert rule engine `check_alert_rules` (declarative rule、 4 per-row op + 3 session-level op + 3 severity + 5 guard、 `analyze_session` 3σ 固定則 補完、 STEP 1471)。
@@ -52,7 +56,7 @@ v0.2.4 は `search_sessions(since='YYYY-MM-DD')` の 解釈を **UTC 文字列�
 | ツール | 役割 |
 |---|---|
 | `list_ports` | 利用可能な装置の一覧。実機が無くても `mock` が必ず出る |
-| `send_command` | 装置に1行送って応答を読む（`*IDN?` など） |
+| ~~`send_command`~~ | **v0.14.0-alpha (2026-09-20) で MCP 面から除去**。 CLI からのみ呼べる: `python benchtop_mcp.py send_command <port> <command> [--baudrate N]`。 任意 SCPI 文字列を機器に投げる汎用口を MCP に露出すると モデルが SafetyGate 未経由の任意コマンドを組み立てられる ため。 shell を持つ agent (Claude Code 等) には効かず、 MCP-only client (Claude Desktop 等) 向けの 事故経路削減。 詳細 CHANGELOG 参照 |
 | `measure` | N 回連続で測定し、セッションとして保存 |
 | `list_sessions` | 保存済みセッションの一覧 |
 | `analyze_session` | 平均・σ・最小/最大・ドリフト・3σ外れ値を算出 |
