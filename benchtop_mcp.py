@@ -22,6 +22,8 @@ AI エージェント（Claude など）に対して、以下の「できるこ�
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import os
@@ -3861,8 +3863,15 @@ def _selftest() -> int:
 
     # -----------------------------------------------------------------------
     # [27] v0.14.0-alpha (STEP 2159): send_command が MCP tools/list に含まれ
-    #       ないことの回帰試験。 将来 うっかり @server.tool() で 再登録された
-    #       場合、 この phase が assertion で 落ちて 気付ける。
+    #       ないこと + CLI dispatcher が 実際に 到達可能 で JSON payload を
+    #       返すこと の 回帰試験。 将来 うっかり @server.tool() で 再登録
+    #       or CLI dispatcher を 壊した 場合、 この phase が assertion で
+    #       落ちて 気付ける。
+    #
+    #       Note: server._tool_manager.list_tools() は FastMCP の private API。
+    #       upstream で 改名されると 本 assertion は AttributeError で 落ちる。
+    #       その場合は 「send_command が 戻った」 ではなく 「upstream API 改名」
+    #       を 疑うこと (chat-Claude 2026-09-21 review 指摘 per)。
     # -----------------------------------------------------------------------
     tool_names = {t.name for t in server._tool_manager.list_tools()}
     assert "send_command" not in tool_names, (
@@ -3876,29 +3885,33 @@ def _selftest() -> int:
     assert "list_ports" in tool_names, "[27] canary: list_ports missing (test infra broken?)"
     assert "measure" in tool_names, "[27] canary: measure missing (test infra broken?)"
 
-    # CLI 経路が到達可能なことを 直接検証 (Bench.send_command が class method として
-    # 保持されている、 かつ CLI dispatcher が argparse で受理する)
+    # Bench.send_command class method が 保持されていることを 明示 verify
     assert hasattr(BENCH, "send_command"), "[27] Bench.send_command class method missing"
     assert callable(BENCH.send_command), "[27] Bench.send_command not callable"
-    cli_result = _cli_send_command_test_helper()
-    assert cli_result == 0, f"[27] CLI dispatcher returned non-zero: {cli_result}"
+
+    # CLI dispatcher (_cli_send_command) を 実際に 呼び、 stdout を capture して
+    # JSON payload を parse verify。 argparse / __main__ dispatcher / Bench 到達
+    # の 全 chain を 1 shot で 検証する (chat-Claude 2026-09-21 review 反映、
+    # 元 helper は "Bench.send_command 直接叩き" だけで CLI 経路を test して
+    # おらず、 print 文言 と 実測 が 一致していなかった Pattern L を fix)。
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli_rc = _cli_send_command([MOCK_PORT, "*IDN?"])
+    assert cli_rc == 0, f"[27] CLI dispatcher returned non-zero: {cli_rc}"
+    payload = json.loads(buf.getvalue())
+    assert payload["port"] == MOCK_PORT, f"[27] CLI payload.port mismatch: {payload}"
+    assert payload["sent"] == "*IDN?", f"[27] CLI payload.sent mismatch: {payload}"
+    assert isinstance(payload["response"], str), (
+        f"[27] CLI payload.response expected str, got "
+        f"{type(payload['response']).__name__}: {payload}"
+    )
 
     print(f"[27] send_command MCP tool 面 除去 verify: "
           f"MCP tools={len(tool_names)} (send_command 不在)、 "
-          f"Bench.send_command class method 保持、 CLI 経路 到達可能。")
+          f"Bench.send_command class method 保持、 "
+          f"CLI dispatcher 実測 (port={payload['port']} sent={payload['sent']!r} "
+          f"response={payload['response']!r})。")
 
-    return 0
-
-
-def _cli_send_command_test_helper() -> int:
-    """v0.14.0-alpha selftest [27] 用 CLI dispatcher smoke。 mock port で 1 回叩く。
-
-    実装は _cli_send_command と 同型だが、 stdout capture を避ける ため print せず
-    argparse も呼ばずに Bench.send_command を 直接叩いて 到達可能性のみ verify する。
-    (argparse は 独立 test [27b] 候補、 現状は 実装本体到達を最小で確認)。
-    """
-    response = BENCH.send_command(MOCK_PORT, "*IDN?", 9600)
-    assert isinstance(response, str), f"expected str response, got {type(response).__name__}"
     return 0
 
 
