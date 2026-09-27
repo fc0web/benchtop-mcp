@@ -1199,9 +1199,62 @@ if _AUDIT_ENABLED:
         _AUDIT = None
 
 
+# ---------------------------------------------------------------------------
+# v0.14.1-alpha: audit 記録範囲の 明示 (「記録しないものを 列挙する」)
+# ---------------------------------------------------------------------------
+#   v0.3.0 以降 instructions / README は 「全 tool 呼び出しが 記録され」 と 書いて
+#   いたが、 実際に _write_audit を 呼んでいたのは 33 tool のうち 7 tool だけで、
+#   measure_eag / probe_health / akizuki 系 計測 tool は 一件も 記録して いなかった。
+#   主張と 実装の 差は それ自体が accountability の 穴 なので、
+#   (a) 計測・判定 tool に 記録を 足し、
+#   (b) 記録しない tool を 明示 列挙し、
+#   (c) selftest で 「計測 tool が 記録を 書く」 ことを 強制する。
+#
+#   方針: **状態を 動かす / 測定値 or verdict を 産む tool は 記録する。
+#          純粋な 読み出し と 純粋な 計算は 記録しない (但し 列挙する)。**
+# ---------------------------------------------------------------------------
+
+#: 記録する tool (計測・取り込み・判定)。 selftest [16e] が この集合を 検査する。
+AUDITED_TOOLS: frozenset[str] = frozenset({
+    "measure", "find_similar_sessions", "regression_check", "import_external_session",
+    "export_session_csv", "compare_sessions", "check_alert_rules",
+    # v0.14.1-alpha 追加 (これまで 記録されて いなかった 計測・判定 tool)
+    "measure_eag", "probe_health", "measure_eag_replay",
+    "measure_environment", "measure_orientation", "measure_distance",
+    "measure_co2_ndir", "measure_voc_index", "measure_co2_uart_ndir",
+    "analyze_session",
+})
+
+#: 意図的に 記録しない tool と その理由。 「列挙しない除外」 は 穴と 同じ なので 書く。
+UNAUDITED_TOOLS: dict[str, str] = {
+    "list_ports": "read-only 列挙、 機器に 何も 送らない",
+    "list_probes": "read-only 列挙 (内蔵 registry)",
+    "list_smellnet_substances": "read-only 列挙 (embedded fixture)",
+    "list_akizuki_probes": "read-only 列挙 (内蔵 registry)",
+    "list_chem_probes": "read-only 列挙 (内蔵 registry)",
+    "list_uart_chem_probes": "read-only 列挙 (内蔵 registry)",
+    "list_sessions": "read-only 列挙 (保存済 session の 一覧)",
+    "plot_session": "read-only 描画、 既存 session を 変えない",
+    "search_sessions": "read-only 絞り込み (filters は 返り値側に 併記される)",
+    "verify_audit_chain": "audit log 自身の 検証、 記録すると 自己参照で 増殖する",
+    "bekenstein_bound_bits": "純粋計算 (機器・記録に 触れない)",
+    "landauer_min_energy_j": "純粋計算",
+    "lloyd_computation_ceiling": "純粋計算",
+    "operator_space_size": "純粋計算",
+    "compression_upper_bound": "純粋計算",
+    "relational_compression_bound": "純粋計算",
+}
+
+
 def _write_audit(action: str, target: str, result: str = "success",
                  detail: dict[str, Any] | None = None) -> None:
-    """Append audit entry. Failure is swallowed with warn — tool exec must continue."""
+    """Append audit entry. Failure is swallowed with warn — tool exec must continue.
+
+    ★ 正直な限界: append 失敗は stderr warn のみ で tool 実行を 続ける
+      (= 記録側は fail-open)。 「記録が 落ちても 測定は 通る」 という 選択 なので、
+      証跡が 必須の 運用では BENCHTOP_AUDIT_STRICT (未実装) 相当の 判断が 別に必要。
+    ★ 記録する/しない の 範囲は AUDITED_TOOLS / UNAUDITED_TOOLS を 参照。
+    """
     if _AUDIT is None:
         return
     try:
@@ -1230,7 +1283,10 @@ server = MCPServer(
         "search_sessions (日付・note・port・channel での絞り込み、"
         "v0.2.4 で 'YYYY-MM-DD' の日付のみ指定は local midnight として解釈)。"
         "v0.3.0 追加: audit log hash chain (append-only JSONL + sha256 prev-hash)。"
-        "全 tool 呼び出しが 記録され、verify_audit_chain で 改竄検出可能。"
+        "計測・取り込み・判定 tool の 呼び出しが 記録され、verify_audit_chain で 改竄検出可能。"
+        "★ 記録対象は 全 tool ではない: 純粋な 読み出し (list_* / plot_session / "
+        "search_sessions) と 純粋な 計算 (物理上限 6 tool) は 記録しない。"
+        "記録する/しない の 完全な 一覧は AUDITED_TOOLS / UNAUDITED_TOOLS を 参照。"
         "証跡が価値になる領域 (ISO/IEC 17025 / GMP / 監査対応) 用。"
         "v0.4.0 追加: 実験ノート (experiment notebook) fields — measure() に subject / "
         "environment / instrument_config / mystery_id 全 optional 追加、 過去 session を "
@@ -1957,7 +2013,24 @@ def measure_eag(
     verdict_reason, is_mock: True, hardware_available: False, honest_scope,
     d8_mapping_source, source。
     """
-    return _ol_measure_eag(probe_id, odor_name, duration_s, sample_rate_hz, snr_threshold)
+    r = _ol_measure_eag(probe_id, odor_name, duration_s, sample_rate_hz, snr_threshold)
+    _write_audit(
+        action="measure_eag",
+        target=f"probe={probe_id},odor={odor_name}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "duration_s": duration_s,
+            "sample_rate_hz": sample_rate_hz,
+            "snr_threshold": snr_threshold,
+            "snr_ratio": r.get("snr_ratio"),
+            "peak_mv": r.get("peak_mv"),
+            "verdict_d8": r.get("verdict_d8"),
+            "is_mock": r.get("is_mock"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 @server.tool()
@@ -1988,9 +2061,25 @@ def probe_health(
     calibration_max_interval_hours, is_mock: True, hardware_available: False,
     honest_scope, reference, source。
     """
-    return _ol_probe_health(
+    r = _ol_probe_health(
         probe_id, age_hours, last_calibration_hours_ago, calibration_max_interval_hours
     )
+    _write_audit(
+        action="probe_health",
+        target=f"probe={probe_id}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "age_hours": age_hours,
+            "last_calibration_hours_ago": last_calibration_hours_ago,
+            "calibration_max_interval_hours": calibration_max_interval_hours,
+            "verdict": r.get("verdict"),
+            "health_score": r.get("health_score"),
+            "is_calibrated": r.get("is_calibrated"),
+            "degradation_model": r.get("degradation_model"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -2066,6 +2155,43 @@ def list_smellnet_substances() -> dict[str, Any]:
 
 @server.tool()
 def measure_eag_replay(
+    probe_id: str,
+    substance: str,
+    duration_s: float = 3.0,
+    sample_rate_hz: float = 100.0,
+    channel: str | None = None,
+    snr_threshold: float = 3.0,
+) -> dict[str, Any]:
+    """replay-based EAG 測定 (audit 記録つき wrapper)。 実体は
+    `_measure_eag_replay_impl`、 引数検証の 早期 return も 含めて 全経路を 記録する。
+
+    v0.14.1-alpha: 早期 return が 複数ある ため、 各 return に 記録を 散らすのでは なく
+    wrapper 一箇所で 記録する (記録漏れの 経路を 作らない ため)。
+    """
+    r = _measure_eag_replay_impl(
+        probe_id, substance, duration_s, sample_rate_hz, channel, snr_threshold
+    )
+    _write_audit(
+        action="measure_eag_replay",
+        target=f"probe={probe_id},substance={substance}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "duration_s": duration_s,
+            "sample_rate_hz": sample_rate_hz,
+            "channel": channel,
+            "snr_threshold": snr_threshold,
+            "snr_ratio": r.get("snr_ratio"),
+            "verdict_d8": r.get("verdict_d8"),
+            "data_source": r.get("data_source"),
+            "is_embedded_fixture": r.get("is_embedded_fixture"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
+
+
+def _measure_eag_replay_impl(
     probe_id: str,
     substance: str,
     duration_s: float = 3.0,
@@ -2203,7 +2329,19 @@ def measure_environment(
     is_mock: True, hardware_available: False, honest_scope,
     d8_mapping_source, source。
     """
-    return _ak_measure_environment(probe_id, condition_tag)
+    r = _ak_measure_environment(probe_id, condition_tag)
+    _write_audit(
+        action="measure_environment",
+        target=f"probe={probe_id}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "condition_tag": condition_tag,
+            "is_mock": r.get("is_mock"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 @server.tool()
@@ -2229,7 +2367,19 @@ def measure_orientation(
     is_mock: True, hardware_available: False, honest_scope,
     d8_mapping_source, source。
     """
-    return _ak_measure_orientation(probe_id, motion_tag)
+    r = _ak_measure_orientation(probe_id, motion_tag)
+    _write_audit(
+        action="measure_orientation",
+        target=f"probe={probe_id}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "motion_tag": motion_tag,
+            "is_mock": r.get("is_mock"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 @server.tool()
@@ -2256,7 +2406,20 @@ def measure_distance(
     verdict_reason, is_mock: True, hardware_available: False, honest_scope,
     d8_mapping_source, source。
     """
-    return _ak_measure_distance(probe_id, target_tag, timing_budget_ms)
+    r = _ak_measure_distance(probe_id, target_tag, timing_budget_ms)
+    _write_audit(
+        action="measure_distance",
+        target=f"probe={probe_id}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "target_tag": target_tag,
+            "timing_budget_ms": timing_budget_ms,
+            "is_mock": r.get("is_mock"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -2320,7 +2483,19 @@ def measure_co2_ndir(
     is_mock: True, hardware_available: False, honest_scope,
     d8_mapping_source, principle, source。
     """
-    return _ch_measure_co2(probe_id, condition_tag)
+    r = _ch_measure_co2(probe_id, condition_tag)
+    _write_audit(
+        action="measure_co2_ndir",
+        target=f"probe={probe_id}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "condition_tag": condition_tag,
+            "is_mock": r.get("is_mock"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 @server.tool()
@@ -2348,7 +2523,19 @@ def measure_voc_index(
     verdict_d8_symbol, verdict_reason, is_mock: True, hardware_available: False,
     honest_scope, d8_mapping_source, principle, source。
     """
-    return _ch_measure_voc(probe_id, condition_tag)
+    r = _ch_measure_voc(probe_id, condition_tag)
+    _write_audit(
+        action="measure_voc_index",
+        target=f"probe={probe_id}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "condition_tag": condition_tag,
+            "is_mock": r.get("is_mock"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -2414,7 +2601,19 @@ def measure_co2_uart_ndir(
     is_mock: True, is_packet_synthetic: True, hardware_available: False,
     honest_scope, d8_mapping_source, principle, source。
     """
-    return _uc_measure_co2(probe_id, condition_tag)
+    r = _uc_measure_co2(probe_id, condition_tag)
+    _write_audit(
+        action="measure_co2_uart_ndir",
+        target=f"probe={probe_id}",
+        result="success" if r.get("ok") else "error",
+        detail={
+            "condition_tag": condition_tag,
+            "is_mock": r.get("is_mock"),
+            "hardware_available": r.get("hardware_available"),
+            "error": r.get("error"),
+        },
+    )
+    return r
 
 
 @server.tool()
@@ -2444,7 +2643,14 @@ def analyze_session(sid: str = "", session_id: str = "") -> dict[str, Any]:
     s = _load_session_or_error(session_id)
     if isinstance(s, dict):
         return s
-    return Bench.analyze(s)
+    a = Bench.analyze(s)
+    _write_audit(
+        action="analyze_session",
+        target=sid or session_id,
+        result="error" if a.get("error") else ("partial" if a.get("partial") else "success"),
+        detail={"error": a.get("error"), "partial": a.get("partial")},
+    )
+    return a
 
 
 @server.tool()
@@ -3190,6 +3396,144 @@ def _selftest() -> int:
               f"valid={chk4['valid']} broken_at={chk4.get('broken_at')}")
         assert chk4["valid"] is False
         assert chk4.get("broken_at") == 1
+
+    # ---------------------------------------------------------------------
+    # [16e] v0.14.1-alpha: audit 記録範囲の 強制
+    #   v0.3.0〜v0.14.0-alpha は 「全 tool 呼び出しが 記録され」 と 主張しながら
+    #   33 tool のうち 7 tool しか 記録して いなかった。 主張と 実装が ずれない
+    #   ように、 (1) 全 tool が どちらかの 集合に 分類されて いること、
+    #   (2) AUDITED_TOOLS の 各 tool の 実装が 実際に _write_audit を 呼ぶこと、
+    #   (3) 代表 tool が 実際に 1 行 書くこと、 を ここで 検査する。
+    # ---------------------------------------------------------------------
+    print("\n--- [16e] v0.14.1-alpha: audit 記録範囲の 強制 ---")
+
+    import ast as _ast
+    import inspect as _inspect
+    import textwrap as _textwrap
+
+    def _calls_write_audit(fn: Any) -> bool | None:
+        """fn の 本体に _write_audit(...) の **呼び出し** が あるか を AST で 判定。
+
+        source 文字列の grep だと docstring 内に literal `_write_audit(` を 書いた
+        tool を 取り違える (AUDITED 側では 見逃し、 UNAUDITED 側では 誤検出)。
+        呼び出し node だけ を 見る ことで その 誤差を 消す。
+        source が 取得できない 場合は None (判定不能) を 返す。
+        """
+        try:
+            src = _textwrap.dedent(_inspect.getsource(fn))
+        except (OSError, TypeError):
+            return None
+        try:
+            tree = _ast.parse(src)
+        except SyntaxError:
+            return None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                f = node.func
+                if isinstance(f, _ast.Name) and f.id == "_write_audit":
+                    return True
+                if isinstance(f, _ast.Attribute) and f.attr == "_write_audit":
+                    return True
+        return False
+
+    _classified = AUDITED_TOOLS | set(UNAUDITED_TOOLS)
+
+    # (1) 二集合は 重ならない、 かつ **実際に 登録されて いる tool 集合と 一致する**。
+    #     ★ 一致の 検査が この phase の 主眼: これが 無いと 「新 tool を 足して
+    #       分類を 忘れる」 が 黙って 通り、 この patch が 直した はずの 欠陥
+    #       (主張が 実装を 超える) を 検査 自身が 再現して しまう。
+    #       登録一覧は phase [27] と 同じ source (server._tool_manager) から 取る。
+    _registered = {t.name for t in server._tool_manager.list_tools()}
+    _overlap = AUDITED_TOOLS & set(UNAUDITED_TOOLS)
+    _unclassified = _registered - _classified
+    _phantom = _classified - _registered
+    print(f"[16e-1] AUDITED={len(AUDITED_TOOLS)} UNAUDITED={len(UNAUDITED_TOOLS)} "
+          f"classified={len(_classified)} registered={len(_registered)} "
+          f"overlap={sorted(_overlap)}")
+    print(f"[16e-1b] 未分類の登録tool={sorted(_unclassified)} "
+          f"実在しない分類entry={sorted(_phantom)}")
+    assert not _overlap, f"tool が 両方の 集合に ある: {sorted(_overlap)}"
+    assert not _unclassified, (
+        f"登録されて いるのに AUDITED/UNAUDITED どちらにも 無い tool: "
+        f"{sorted(_unclassified)} — 新 tool を 足したら どちらかに 分類する こと"
+    )
+    assert not _phantom, (
+        f"分類に あるが 登録されて いない名前: {sorted(_phantom)} — "
+        f"tool の 改名・削除に 分類が 追いついて いない"
+    )
+    assert _registered == _classified
+
+    # (2) UNAUDITED は 理由が 空でない (「列挙しない除外」 を 作らない)
+    _no_reason = [t for t, why in UNAUDITED_TOOLS.items() if not why.strip()]
+    assert not _no_reason, f"除外理由が 空: {_no_reason}"
+
+    # (3) AUDITED_TOOLS の 各 tool が 実際に _write_audit を 呼ぶ (AST 判定)
+    _missing: list[str] = []
+    _undecidable: list[str] = []
+    for _name in sorted(AUDITED_TOOLS):
+        _fn = globals().get(_name)
+        if _fn is None:
+            _missing.append(f"{_name}(未定義)")
+            continue
+        _verdict = _calls_write_audit(_fn)
+        if _verdict is None:
+            _undecidable.append(_name)
+        elif _verdict is False:
+            _missing.append(_name)
+    print(f"[16e-2] AUDITED_TOOLS で _write_audit を 呼ばない tool: {_missing} "
+          f"(判定不能={_undecidable})")
+    assert not _missing, f"記録すると 宣言した tool が 記録して いない: {_missing}"
+    assert not _undecidable, f"source が 読めず 判定できない tool: {_undecidable}"
+
+    # (4) UNAUDITED_TOOLS 側は 逆に 呼んで いない (宣言と 実装の 逆ずれ 防止)
+    _unexpected: list[str] = []
+    for _name in sorted(UNAUDITED_TOOLS):
+        _fn = globals().get(_name)
+        if _fn is None:
+            continue
+        if _calls_write_audit(_fn) is True:
+            _unexpected.append(_name)
+    print(f"[16e-3] UNAUDITED_TOOLS なのに 記録する tool: {_unexpected}")
+    assert not _unexpected, f"記録しないと 宣言した tool が 記録して いる: {_unexpected}"
+
+    # (3b) AST 判定が grep より 厳しい ことの 実証: docstring に literal を 書いた
+    #      偽の tool を 作り、 grep では 通るが AST では 落ちる ことを 確認する。
+    def _fake_audited_tool() -> dict[str, Any]:
+        """例示: 記録するには _write_audit(action=..., target=...) を 呼ぶ。
+
+        但し この 関数は 実際には 呼んで いない (docstring の 例示のみ)。
+        """
+        return {"ok": True}
+
+    _fake_src = _inspect.getsource(_fake_audited_tool)
+    print(f"[16e-3b] docstring に literal だけ ある 関数: "
+          f"grep判定={'_write_audit(' in _fake_src} AST判定={_calls_write_audit(_fake_audited_tool)}")
+    assert "_write_audit(" in _fake_src, "grep なら 通って しまう ことの 確認"
+    assert _calls_write_audit(_fake_audited_tool) is False, "AST は 呼び出し無しを 見抜く"
+
+    # (5) 実際に 1 行 増えること (measure_eag = これまで 記録ゼロ だった 代表)
+    with tempfile.TemporaryDirectory(prefix="benchtop-audit-16e-") as _tmpd2:
+        _saved_audit = _AUDIT
+        try:
+            globals()["_AUDIT"] = _AL(_tmpd2)
+            _before = len(globals()["_AUDIT"].read_all())
+            _r16e = measure_eag(probe_id="silkworm-antenna-a1", odor_name="cis-3-hexenol",
+                                duration_s=1.0, sample_rate_hz=50.0)
+            _h16e = probe_health(probe_id="silkworm-antenna-a1", age_hours=1.0)
+            _entries = globals()["_AUDIT"].read_all()
+            _actions = [e.get("action") for e in _entries]
+            print(f"[16e-4] measure_eag/probe_health 呼出後の audit 行: "
+                  f"{_before} → {len(_entries)} actions={_actions}")
+            assert "measure_eag" in _actions, "measure_eag が 記録されて いない"
+            assert "probe_health" in _actions, "probe_health が 記録されて いない"
+            _chk16e = _AL.verify_chain(_tmpd2)
+            print(f"[16e-5] 追加後の chain: valid={_chk16e['valid']} total={_chk16e['total']}")
+            assert _chk16e["valid"] is True
+            assert _r16e.get("ok") is True and _h16e.get("ok") is True
+        finally:
+            globals()["_AUDIT"] = _saved_audit
+
+    print("[16e] PASS: audit 記録範囲が 宣言と 一致")
 
     # [19] v0.5.0-alpha SPIKE : import_external_session + SafetyGate + provenance layer
     # chat-Claude 2026-08-18 「MCP コネクタ世界一」 report §3-1 「機器層/記録層 分割」 の

@@ -56,9 +56,32 @@ class AuditLogWriter:
       actor     : who initiated (e.g. 'benchtop-mcp')
       action    : tool name (e.g. 'measure', 'compare_sessions')
       target    : what was operated on (e.g. session_id, port)
-      result    : 'success' | 'error' | 'partial' | 'aborted'
+      result    : see RESULT_VOCABULARY below
       detail    : arbitrary dict for extra context
       prev      : sha256:<hex> of previous line (or GENESIS_HASH for first)
+
+    ★ result の 語彙 (RESULT_VOCABULARY):
+      実際に 産出側 (benchtop_mcp.py) が 書く 値 のみ を 列挙する。 「書かれない値を
+      docstring に 載せる」 のは 能力の 過大表示 なので しない。
+
+        'success'  : tool が 完走した            [selftest 実測: 41 行]
+        'error'    : tool が 失敗した             [selftest 実測: 22 行]
+        'rejected' : SafetyGate が record を 全拒否 [selftest 実測: 1 行]
+                     産出箇所: import_external_session (benchtop_mcp.py)
+        'partial'  : 完走したが 記録が 不完全 (session.aborted_at が 立っている)
+                     産出箇所: measure / analyze_session (benchtop_mcp.py)
+                     ★ **selftest を 通しても 一度も 書かれない** (実測 0 行)。
+                       コード上の 産出経路は ある が、 試験で 踏まれて いない ので
+                       「書かれる ことを 確認済」 とは 言えない。 abort を 起こす
+                       session を MCP tool 経由で 作る phase を 足す まで、
+                       この一行は 未実証 として 扱う こと。
+
+      ★★ 現時点で 「人の承認」 に 由来する result は 存在しない。
+         benchtop-mcp には 人が 帯域外で 承認/否認する 経路が そもそも 無い ため、
+         'denied' (人が 否認した) / 'timeout_denied' (誰も 答えなかった) は
+         **産出側が 無いので 定義しない**。 承認段を 実装する ときに 同時に 足すこと。
+         参照: ceobigg10/askgate が 'timeout-deny' を 人の否認と 別事象に している。
+         先に 語彙だけ 足すと 「承認機構が ある」 と 誤読される (⑯ の 型)。
     """
 
     def __init__(self, audit_dir: str, filename: str = DEFAULT_FILENAME) -> None:
