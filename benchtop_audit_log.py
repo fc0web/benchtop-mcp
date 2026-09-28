@@ -30,6 +30,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,57 @@ DEFAULT_FILENAME = "audit.jsonl"
 def _sha256_of(line: str) -> str:
     """Compute sha256 hash of a JSONL line (returns 'sha256:...' format)."""
     return "sha256:" + hashlib.sha256(line.encode("utf-8")).hexdigest()
+
+
+class _CrossProcessLock:
+    """
+    Blocking exclusive file lock backed by a sibling `<log>.lock` file.
+
+    Needed to serialise append() across multiple benchtop-mcp processes that
+    share the same audit dir. Without this, each process's writer instance
+    holds its own cached `last_hash` from the file's tail as it was at
+    __init__ time and every subsequent append it does emits `prev` = that
+    stale value. Interleaved writes from other processes then produce chain
+    breaks even though every individual line is well-formed (observed as
+    ``broken_at`` pointing back to earlier legitimate entries rather than to
+    a corrupted line — the mcp-lens "byte-exact adjacent duplicate" pattern
+    does NOT apply here).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fh = None
+
+    def __enter__(self) -> "_CrossProcessLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a+b")
+        if sys.platform == "win32":
+            import msvcrt
+            while True:
+                try:
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
 
 
 class AuditLogWriter:
@@ -92,6 +145,10 @@ class AuditLogWriter:
     def _log_path(self) -> Path:
         return self.audit_dir / self.filename
 
+    def _lock_path(self) -> Path:
+        p = self._log_path()
+        return p.with_suffix(p.suffix + ".lock")
+
     def _load_last_hash(self) -> str:
         """Load the sha256 of the last line in the audit log (for chain continuation)."""
         p = self._log_path()
@@ -120,24 +177,34 @@ class AuditLogWriter:
 
         Raises on I/O failure; caller decides whether to kill execution or
         continue with an accountability gap.
+
+        ★ Serialisation: this method acquires a cross-process exclusive lock
+        (`<audit>.lock`) and re-reads the tail of the file BEFORE building the
+        entry. The re-read is what actually prevents the chain from breaking
+        when a long-lived writer instance's cached `last_hash` has gone stale
+        because another process appended in the meantime; the lock is what
+        keeps two concurrent writers from racing on the file position. Both
+        are needed. Wire format and the sha256 computation are unchanged.
         """
-        entry: dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "actor": actor,
-            "action": action,
-            "target": target,
-            "result": result,
-            "prev": self.last_hash,
-        }
-        if detail is not None:
-            entry["detail"] = detail
-        line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
         self.audit_dir.mkdir(parents=True, exist_ok=True)
-        with self._log_path().open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        h = _sha256_of(line)
-        self.last_hash = h
-        return h
+        with _CrossProcessLock(self._lock_path()):
+            self.last_hash = self._load_last_hash()
+            entry: dict[str, Any] = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "actor": actor,
+                "action": action,
+                "target": target,
+                "result": result,
+                "prev": self.last_hash,
+            }
+            if detail is not None:
+                entry["detail"] = detail
+            line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+            with self._log_path().open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            h = _sha256_of(line)
+            self.last_hash = h
+            return h
 
     def read_all(self) -> list[dict[str, Any]]:
         """Snapshot read. Never rewrite the file — audit log is append-only."""
